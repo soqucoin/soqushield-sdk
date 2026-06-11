@@ -11,6 +11,7 @@
 library;
 
 import 'dart:ffi';
+import 'dart:io' show Platform;
 import 'dart:typed_data';
 
 /// ML-DSA-44 (FIPS 204) public key size in bytes.
@@ -66,14 +67,19 @@ class DilithiumNative {
 
     DynamicLibrary lib;
     try {
-      // With use_frameworks!, CocoaPods wraps the pod in a .framework bundle.
-      // On iOS simulator, frameworks are loaded into the process automatically
-      // by the dyld. Try RTLD_DEFAULT first.
-      lib = DynamicLibrary.process();
-      lib.lookup<NativeFunction<Void Function()>>('soq_dilithium_keypair_from_seed');
+      if (Platform.isAndroid) {
+        // Android: native assets are bundled as .so files in the APK's lib/ dir.
+        // The Android dynamic linker finds them by name.
+        lib = DynamicLibrary.open('libdilithium_soq.so');
+      } else {
+        // iOS/macOS: With use_frameworks!, CocoaPods wraps the pod in a
+        // .framework bundle. Try RTLD_DEFAULT first.
+        lib = DynamicLibrary.process();
+        lib.lookup<NativeFunction<Void Function()>>('soq_dilithium_keypair_from_seed');
+      }
     } catch (_) {
       try {
-        // If process() fails, try opening the framework directly.
+        // Fallback: try opening the framework directly (iOS)
         lib = DynamicLibrary.open('dilithium_soq.framework/dilithium_soq');
       } catch (_) {
         try {
