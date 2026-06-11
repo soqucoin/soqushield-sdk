@@ -1,0 +1,36 @@
+name: soqushield_sdk
+description: >
+  SoquShield SDK — Post-quantum cryptographic primitives for the Soqucoin
+  blockchain. Provides ML-DSA-44 (Dilithium) signing, PQ key management,
+  address encoding, RPC client, and vault bridge operations.
+version: 0.1.0
+homepage: https://soqu.org
+repository: https://github.com/soqucoin/soqushield-sdk
+
+environment:
+  sdk: ^3.11.0
+
+dependencies:
+  # Cryptographic primitives
+  bip39: ^1.0.6
+  pointycastle: ^3.9.1
+  hashlib: ^1.19.2
+  bech32: ^0.2.2
+  convert: ^3.1.1
+  crypto: ^3.0.7
+
+  # Networking
+  dio: ^5.9.1
+  http: ^1.6.0
+
+  # Storage (optional — consumers can provide their own)
+  hive: ^2.2.3
+
+  # Native FFI support
+  hooks: any
+  native_toolchain_c: any
+  logging: any
+
+dev_dependencies:
+  test: ^1.25.0
+  lints: ^6.0.0
