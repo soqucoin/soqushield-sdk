@@ -1,0 +1,15 @@
+{
+  "_source": "soq-lightning-sdk/test/vector.test.mjs — node-pinned (b1_dump_vectors, Phase-4 byte-less, cross-checked DL-PHASE4-VECTOR-REGEN.md)",
+  "version": 2,
+  "locktime": 1,
+  "vin0_prevout_hash": "ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100",
+  "vin0_prevout_n": 3,
+  "vin0_sequence": 0,
+  "vout0_value": 10000000000,
+  "vout0_scriptpubkey_hex": "51",
+  "scriptcode_hex": "76a914aabbccddeeff00112233445566778899aabbccdd88ac",
+  "amount_sat": 10000000000,
+  "digest_apo_0x42": "4c8c1f5ee5be7a8d654f8bbe281b469423d3cf9b180319baf638b288579084ce",
+  "digest_apo_0x41": "3e5752e00dd14ef60bf41fce71ab27ea96be2d3ec9e6d331040e815a29d51edb",
+  "ctv_hash": "4a0575860c4e73b17c3e5ba537b094cdf9b2c9b9d866032c59b7ff0a2db8d396"
+}
