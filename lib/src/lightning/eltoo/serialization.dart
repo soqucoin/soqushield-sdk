@@ -117,18 +117,23 @@ class OutPoint {
   }
 }
 
-/// A transaction input. [scriptPubKey] is the input's scriptPubKey (the BIP143 scriptCode);
-/// the on-wire scriptSig is always empty for witness inputs. [witness] is the witness stack.
+/// A transaction input. [scriptPubKey] is the input's scriptPubKey (the BIP143 scriptCode).
+/// For segwit broadcast ([serializeTx]) the on-wire scriptSig is always empty and [witness]
+/// carries the data. [scriptSig] is used only by the legacy/opaque transport serializer
+/// ([serializeTxLegacy]) — the eLTOO builder stuffs its signature there for the LSP's opaque
+/// update_tx_hex (real broadcast uses the witness).
 class TxIn {
   final OutPoint prevout;
   final int sequence;
   final Uint8List scriptPubKey;
   final List<Uint8List>? witness;
+  final Uint8List? scriptSig;
   const TxIn({
     required this.prevout,
     required this.sequence,
     required this.scriptPubKey,
     this.witness,
+    this.scriptSig,
   });
 }
 
@@ -199,11 +204,18 @@ Uint8List serializeTx(Tx tx) {
 String serializeTxHex(Tx tx) => toHex(serializeTx(tx));
 
 /// txid: SHA256d of the NON-witness serialization, reversed to display order.
-String txid(Tx tx) {
+String txid(Tx tx) => toHex(reversed(_txidInternal(tx)));
+
+/// txid in INTERNAL byte order (not display-reversed) — what an [OutPoint] consumes as the
+/// prevout of a spending tx (e.g. the eLTOO settlement spending the update). scriptSig is
+/// cleared (the txid commits to the unsigned form).
+Uint8List txidInternal(Tx tx) => _txidInternal(tx);
+
+Uint8List _txidInternal(Tx tx) {
   final parts = <Uint8List>[le32(tx.version), compactSize(tx.vin.length)];
   for (final i in tx.vin) {
     parts.add(serOutpoint(i));
-    parts.add(compactSize(0));
+    parts.add(compactSize(0)); // empty scriptSig
     parts.add(le32(i.sequence));
   }
   parts.add(compactSize(tx.vout.length));
@@ -211,5 +223,25 @@ String txid(Tx tx) {
     parts.add(serTxOut(o));
   }
   parts.add(le32(tx.locktime));
-  return toHex(reversed(sha256d(concatBytes(parts))));
+  return sha256d(concatBytes(parts));
+}
+
+/// Legacy (non-witness) serialization that INCLUDES each input's [TxIn.scriptSig] (channel.ts
+/// serializeTx). Used for the LSP's opaque update/settlement transport hex, where the eLTOO
+/// builder stuffs the 0x42 signature into scriptSig. Real broadcast uses [serializeTx] (witness).
+Uint8List serializeTxLegacy(Tx tx) {
+  final parts = <Uint8List>[le32(tx.version), compactSize(tx.vin.length)];
+  for (final i in tx.vin) {
+    final ss = i.scriptSig ?? Uint8List(0);
+    parts.add(serOutpoint(i));
+    parts.add(compactSize(ss.length));
+    parts.add(ss);
+    parts.add(le32(i.sequence));
+  }
+  parts.add(compactSize(tx.vout.length));
+  for (final o in tx.vout) {
+    parts.add(serTxOut(o));
+  }
+  parts.add(le32(tx.locktime));
+  return concatBytes(parts);
 }
