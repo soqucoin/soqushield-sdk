@@ -298,3 +298,39 @@ List<Uint8List> signKeyhashFunding2of2(
   return combineKeyhash2of2Witness(funding.witnessScript, [pa, pb],
       trailingPubKey: dilithiumWitnessPubKey(pubA));
 }
+
+// ── B1 branch witnesses (step 4) ──
+// The v6 satisfaction layouts a node accepts for spending the B1 eLTOO/HTLC outputs. Each is the
+// branch's keyhash satisfaction followed by the OP_IF selector (truthy 0x01 = IF, empty = ELSE),
+// then the witnessScript + trailing 0x00-prefixed pubkey. Pinned by the node tests
+// lightning_script_tests.cpp/{eltoo_v6_ratchet_target,htlc_v6_target}.
+
+final Uint8List _selTrue = Uint8List.fromList([0x01]); // truthy IF selector
+final Uint8List _selFalse = Uint8List(0); // empty → CastToBool false → ELSE
+
+/// B1 eLTOO UPDATE-branch (supersession, IF) witness. sigA/pubA commit to khAupdate, sigB/pubB to
+/// khBupdate (B is checked first → ends up on top): satisfaction = [sigA, pubA, sigB, pubB, TRUE].
+/// The spending (next-state) update tx sets nLockTime ≥ stateNum+1 so its CLTV ratchet passes.
+List<Uint8List> eltooUpdateBranchWitness(Uint8List eltooScript, Uint8List sigA, Uint8List pubA,
+        Uint8List sigB, Uint8List pubB, Uint8List trailing) =>
+    p2wshV6Witness([sigA, pubA, sigB, pubB, _selTrue], eltooScript, trailing);
+
+/// B1 eLTOO SETTLEMENT-branch (close, ELSE) witness: same 2-of-2 satisfaction with a FALSE
+/// selector. The settlement tx must spend with nSequence ≥ settlementCsv (the CSV delay).
+List<Uint8List> eltooSettlementBranchWitness(Uint8List eltooScript, Uint8List sigA, Uint8List pubA,
+        Uint8List sigB, Uint8List pubB, Uint8List trailing) =>
+    p2wshV6Witness([sigA, pubA, sigB, pubB, _selFalse], eltooScript, trailing);
+
+/// B1 HTLC SUCCESS (IF) witness: [sigPayee, pubPayee, preimage, TRUE]. [preimage] must SHA256 to
+/// the committed paymentHash.
+List<Uint8List> htlcSuccessWitness(Uint8List htlcScript, Uint8List sigPayee, Uint8List pubPayee,
+    Uint8List preimage, Uint8List trailing) {
+  if (preimage.length != 32) throw ArgumentError('preimage must be 32 bytes');
+  return p2wshV6Witness([sigPayee, pubPayee, preimage, _selTrue], htlcScript, trailing);
+}
+
+/// B1 HTLC TIMEOUT (ELSE) witness: [sigPayer, pubPayer, FALSE]. The claim tx must set
+/// nLockTime ≥ cltvExpiry with a non-final input so the CLTV passes.
+List<Uint8List> htlcTimeoutWitness(Uint8List htlcScript, Uint8List sigPayer, Uint8List pubPayer,
+        Uint8List trailing) =>
+    p2wshV6Witness([sigPayer, pubPayer, _selFalse], htlcScript, trailing);

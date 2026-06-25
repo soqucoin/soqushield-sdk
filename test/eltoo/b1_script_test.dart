@@ -41,6 +41,43 @@ void main() {
       );
     });
 
+    test('B1 branch witnesses match the node-accepted satisfaction layout', () {
+      final sigA = Uint8List(2421)..fillRange(0, 2421, 0x01);
+      final pubA = Uint8List(1312)..fillRange(0, 1312, 0xa1);
+      final sigB = Uint8List(2421)..fillRange(0, 2421, 0x02);
+      final pubB = Uint8List(1312)..fillRange(0, 1312, 0xb2);
+      final script = Uint8List.fromList([0x63, 0x68]); // any witnessScript stand-in
+      final trailing = dilithiumWitnessPubKey(pubA); // 0x00 ‖ pubA
+
+      // UPDATE branch: [sigA, pubA, sigB, pubB, 0x01, script, trailing]
+      final up = eltooUpdateBranchWitness(script, sigA, pubA, sigB, pubB, trailing);
+      expect(up.length, 7);
+      expect(up[0], sigA);
+      expect(up[1], pubA);
+      expect(up[2], sigB);
+      expect(up[3], pubB);
+      expect(up[4], Uint8List.fromList([0x01])); // truthy IF selector
+      expect(up[5], script);
+      expect(up[6][0], 0x00); // trailing v6 pubkey is 0x00-prefixed
+
+      // SETTLEMENT branch: same but FALSE (empty) selector
+      final set = eltooSettlementBranchWitness(script, sigA, pubA, sigB, pubB, trailing);
+      expect(set.length, 7);
+      expect(set[4].isEmpty, isTrue); // empty → ELSE branch
+
+      // HTLC success: [sigPayee, pubPayee, preimage, 0x01, script, trailing]
+      final preimage = Uint8List(32)..fillRange(0, 32, 0x07);
+      final ok = htlcSuccessWitness(script, sigA, pubA, preimage, trailing);
+      expect(ok.length, 6);
+      expect(ok[2], preimage);
+      expect(ok[3], Uint8List.fromList([0x01]));
+
+      // HTLC timeout: [sigPayer, pubPayer, empty, script, trailing]
+      final to = htlcTimeoutWitness(script, sigA, pubA, trailing);
+      expect(to.length, 5);
+      expect(to[2].isEmpty, isTrue);
+    });
+
     test('pubkey wrappers agree with the from-keyhash form', () {
       final pubA = Uint8List(1312)..fillRange(0, 1312, 0xa1);
       final pubB = Uint8List(1312)..fillRange(0, 1312, 0xb2);
