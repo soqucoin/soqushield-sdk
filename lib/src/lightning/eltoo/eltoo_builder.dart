@@ -8,19 +8,23 @@
 // into SoqLightning(txBuilder: ...) makes payments self-custodial with ZERO facade/UI change.
 //
 // For each state transition it builds the canonical eLTOO tx graph (update output re-commits the
-// state-N script; settlement spends it via the CSV branch paying both balances), signs the update
-// input with SIGHASH_ANYPREVOUTANYSCRIPT (0x42, rebindable), and returns the opaque transport hex
-// + the CTV hash committing the settlement payout.
+// state-N B1 script; settlement spends it via the CSV branch paying both balances), signs the
+// update input with SIGHASH_ANYPREVOUTANYSCRIPT (0x42, rebindable), and returns the opaque
+// transport hex + the CTV hash committing the settlement payout.
 //
-// ⚠️ NOT YET NODE-VALIDATED. Like the TS source, the exact tx graph must be byte-checked against a
-// node vector + accepted on stagenet (P6) before any real broadcast. The crypto PRIMITIVES it
-// composes (serialization, APO-0x42 sighash, CTV, keyhash funding) are individually node-pinned
-// (P1–P4); the GRAPH assembly is not. Do not broadcast builder output to mainnet until P6 passes.
+// The update output now carries the B1 eLTOO script (eltooUpdateScriptV6) — IF/CLTV-ratchet +
+// keyhash-2-of-2 — which EXECUTES on V6 under SCRIPT_VERIFY_V6_CONTROLFLOW and is node-pinned
+// (b1_script_vectors). The keyhash sigs are produced via signApoWitness/0x42 (the opcode reads the
+// trailing hashType and CheckSig's over the sighash — the correct primitive for keyhash, unlike
+// CSFS). ⚠️ REMAINING (step 4): the self-custodial BROADCAST witness assembly (the IF/ELSE selector
+// + keyhash 2-of-2 satisfaction + trailing v6 pubkey) and on-chain stagenet acceptance. build()
+// still emits OPAQUE transport hex for the LSP co-sign flow; do not broadcast until step 4 lands.
 
 import 'dart:typed_data';
 
 import '../update_tx_builder.dart';
 import 'ctv.dart';
+import 'keyhash.dart';
 import 'script.dart';
 import 'serialization.dart';
 import 'sighash.dart';
@@ -61,9 +65,10 @@ class DilithiumEltooBuilder implements UpdateTxBuilder {
 
   /// The update TX for state [stateNum]: spends the funding output into a v6 output that
   /// re-commits the state-N eLTOO script. locktime = stateNum+1 satisfies the prior script's
-  /// IF-branch CLTV (newer state supersedes older).
+  /// IF-branch CLTV (newer state supersedes older — this ratchet EXECUTES on V6 under
+  /// SCRIPT_VERIFY_V6_CONTROLFLOW; see DL-V6-CONTROLFLOW-RESTORE).
   Tx buildUpdateTx(int stateNum) {
-    final ws = eltooUpdateScript(stateNum, o.initiatorPub, o.peerPub, settlementCsv: o.settlementCsv);
+    final ws = eltooUpdateScriptV6(stateNum, o.initiatorPub, o.peerPub, settlementCsv: o.settlementCsv);
     return Tx(
       version: 2,
       locktime: stateNum + 1,

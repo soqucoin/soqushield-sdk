@@ -76,25 +76,10 @@ Uint8List p2wshV6(Uint8List witnessScript) =>
 Uint8List dilithiumWitnessPubKey(Uint8List mldsaPubKey) =>
     concatBytes([u8(0x00), mldsaPubKey]);
 
-/// eLTOO update output witness script (channel.ts:96-106, spec §2.2):
-///   IF  <stateNum+1> CLTV DROP  <A> CHECKSIGVERIFY <B> CHECKSIG   (supersession path)
-///   ELSE <csv> CSV DROP         <A> CHECKSIGVERIFY <B> CHECKSIG   (settlement path)
-///   ENDIF
-/// ⚠️ V6 reality: Soqucoin's EvalScript implements no standard opcodes, so this IF/CLTV/CHECKSIG
-/// form is a SPEC REFERENCE that does not execute on-chain — the real authorization is keyhash
-/// 2-of-2 + CSFS/CTV. It is committed as the update output's script for the canonical tx graph;
-/// the graph must be byte-validated against a node vector before mainnet (P6 / B1 §3.5).
-Uint8List eltooUpdateScript(int stateNum, Uint8List aPub, Uint8List bPub, {int settlementCsv = 288}) {
-  return concatBytes([
-    u8(Op.opIf),
-    scriptNum(stateNum + 1), u8(Op.cltv), u8(Op.opDrop),
-    pushData(aPub), u8(Op.checksigverify), pushData(bPub), u8(Op.checksig),
-    u8(Op.opElse),
-    scriptNum(settlementCsv), u8(Op.csv), u8(Op.opDrop),
-    pushData(aPub), u8(Op.checksigverify), pushData(bPub), u8(Op.checksig),
-    u8(Op.opEndif),
-  ]);
-}
+// The eLTOO update output witnessScript now lives in keyhash.dart as
+// eltooUpdateScriptV6 (DL-V6-CONTROLFLOW-RESTORE §4.1) — IF/CLTV-ratchet + keyhash-2-of-2,
+// which actually EXECUTES on V6. The old IF/CLTV/CHECKSIG spec-reference (inline 1312-byte
+// pubkeys > 520-byte push limit, no-op opcodes) has been removed: it never executed on-chain.
 
 /// Assemble a v6 witness stack: [...satisfaction, witnessScript, trailingPubKey].
 /// [trailingPubKey] must already be 0x00-prefixed (use [dilithiumWitnessPubKey]).

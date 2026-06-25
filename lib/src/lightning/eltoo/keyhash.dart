@@ -36,13 +36,96 @@ Uint8List dilithiumKeyhashScript(Uint8List rawPubKey) => concatBytes([
       u8(Op.opOne),
     ]);
 
+/// Key-committed 2-of-2 body from raw 32-byte keyhashes: `<khB> OP_CDKH <khA> OP_CDKH OP_1`.
+/// khB is committed FIRST because the first opcode checks the TOP eval item (witness puts B on top).
+Uint8List dilithiumKeyhash2of2ScriptFromHashes(Uint8List khA, Uint8List khB) {
+  if (khA.length != 32 || khB.length != 32) {
+    throw ArgumentError('keyhash must be 32 bytes');
+  }
+  return concatBytes([
+    pushData(khB), u8(Op.checkdilithiumkeyhash),
+    pushData(khA), u8(Op.checkdilithiumkeyhash),
+    u8(Op.opOne),
+  ]);
+}
+
 /// Key-committed 2-of-2 script: `<kh(pubB)> OP_CDKH <kh(pubA)> OP_CDKH OP_1`. pubB is committed
 /// FIRST because the first opcode checks the TOP eval item, and the witness puts pubB on top.
-Uint8List dilithiumKeyhash2of2Script(Uint8List pubA, Uint8List pubB) => concatBytes([
-      pushData(dilithiumKeyHash(pubB)), u8(Op.checkdilithiumkeyhash),
-      pushData(dilithiumKeyHash(pubA)), u8(Op.checkdilithiumkeyhash),
-      u8(Op.opOne),
+Uint8List dilithiumKeyhash2of2Script(Uint8List pubA, Uint8List pubB) =>
+    dilithiumKeyhash2of2ScriptFromHashes(dilithiumKeyHash(pubA), dilithiumKeyHash(pubB));
+
+/// B1 eLTOO update output witnessScript (DL-V6-CONTROLFLOW-RESTORE §4.1):
+///   IF  <stateNum+1> CLTV DROP  <khBupdate> CDKH <khAupdate> CDKH OP_1   (supersession, APO-0x42)
+///   ELSE <csv> CSV DROP         <khBsettle> CDKH <khAsettle> CDKH OP_1   (settlement after CSV)
+///   ENDIF
+/// The CLTV ratchet (newer state supersedes older) and the CSV settlement delay EXECUTE on V6 once
+/// SCRIPT_VERIFY_V6_CONTROLFLOW is active. Settlement keyhashes default to the update keyhashes.
+/// Node-pinned: lightning_script_tests.cpp/b1_script_vectors.
+Uint8List eltooUpdateScriptV6FromKeyhashes(
+  int stateNum,
+  Uint8List khAupdate,
+  Uint8List khBupdate, {
+  Uint8List? khAsettle,
+  Uint8List? khBsettle,
+  int settlementCsv = 288,
+}) =>
+    concatBytes([
+      u8(Op.opIf),
+      scriptNum(stateNum + 1), u8(Op.cltv), u8(Op.opDrop),
+      dilithiumKeyhash2of2ScriptFromHashes(khAupdate, khBupdate),
+      u8(Op.opElse),
+      scriptNum(settlementCsv), u8(Op.csv), u8(Op.opDrop),
+      dilithiumKeyhash2of2ScriptFromHashes(khAsettle ?? khAupdate, khBsettle ?? khBupdate),
+      u8(Op.opEndif),
     ]);
+
+/// [eltooUpdateScriptV6FromKeyhashes] taking raw 1312-byte ML-DSA pubkeys (hashed internally).
+Uint8List eltooUpdateScriptV6(
+  int stateNum,
+  Uint8List updateA,
+  Uint8List updateB, {
+  Uint8List? settleA,
+  Uint8List? settleB,
+  int settlementCsv = 288,
+}) =>
+    eltooUpdateScriptV6FromKeyhashes(
+      stateNum,
+      dilithiumKeyHash(updateA),
+      dilithiumKeyHash(updateB),
+      khAsettle: settleA == null ? null : dilithiumKeyHash(settleA),
+      khBsettle: settleB == null ? null : dilithiumKeyHash(settleB),
+      settlementCsv: settlementCsv,
+    );
+
+/// B1 HTLC output witnessScript (DL-V6-CONTROLFLOW-RESTORE §4.2):
+///   IF  OP_SHA256 <paymentHash> OP_EQUALVERIFY <khPayee> CDKH OP_1   (SUCCESS: preimage + payee sig)
+///   ELSE <cltvExpiry> CLTV DROP <khPayer> CDKH OP_1                  (TIMEOUT: absolute CLTV + payer)
+///   ENDIF
+/// Node-pinned: lightning_script_tests.cpp/b1_script_vectors.
+Uint8List htlcScriptV6FromKeyhashes(
+  Uint8List paymentHash,
+  Uint8List khPayee,
+  Uint8List khPayer,
+  int cltvExpiry,
+) {
+  if (paymentHash.length != 32) {
+    throw ArgumentError('paymentHash must be 32 bytes');
+  }
+  return concatBytes([
+    u8(Op.opIf),
+    u8(Op.opSha256), pushData(paymentHash), u8(Op.equalverify),
+    pushData(khPayee), u8(Op.checkdilithiumkeyhash), u8(Op.opOne),
+    u8(Op.opElse),
+    scriptNum(cltvExpiry), u8(Op.cltv), u8(Op.opDrop),
+    pushData(khPayer), u8(Op.checkdilithiumkeyhash), u8(Op.opOne),
+    u8(Op.opEndif),
+  ]);
+}
+
+/// [htlcScriptV6FromKeyhashes] taking raw 1312-byte ML-DSA pubkeys (hashed internally).
+Uint8List htlcScriptV6(Uint8List paymentHash, Uint8List payeePub, Uint8List payerPub, int cltvExpiry) =>
+    htlcScriptV6FromKeyhashes(
+        paymentHash, dilithiumKeyHash(payeePub), dilithiumKeyHash(payerPub), cltvExpiry);
 
 /// v6 witness for a single-key committed spend. Eval items: [sig, pub] (pub on top).
 List<Uint8List> dilithiumKeyhashWitness(

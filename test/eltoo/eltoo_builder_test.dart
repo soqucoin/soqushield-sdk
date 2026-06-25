@@ -70,8 +70,8 @@ void main() {
       expect(tx.vin[0].sequence, 0);
       expect(tx.vout.length, 1);
       expect(tx.vout[0].value, fundingAmount);
-      // output re-commits the state-N eLTOO script as a v6 program
-      final expectedSpk = p2wshV6(eltooUpdateScript(5, initiatorPub, peerPub, settlementCsv: 288));
+      // output re-commits the state-N B1 eLTOO script as a v6 program
+      final expectedSpk = p2wshV6(eltooUpdateScriptV6(5, initiatorPub, peerPub, settlementCsv: 288));
       expect(toHex(tx.vout[0].scriptPubKey), toHex(expectedSpk));
     });
 
