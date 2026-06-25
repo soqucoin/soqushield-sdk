@@ -161,8 +161,25 @@ class TxOutput {
     this.visibility = 0,
   });
 
-  /// Whether this output carries USDSOQ.
-  bool get isUsdsoq => assetType == 1;
+  /// Whether this output is a v7 USDSOQ holding (OP_7 <32-byte program>), by witness
+  /// version. CTxOut migration Phase 3: USDSOQ classification follows the witness VERSION,
+  /// independent of the nAssetType byte. Mirrors the node's CTxOut::IsUSDSOQ() and
+  /// soq-signer's classify hardening.
+  bool get isV7UsdsoqHolding => isV7UsdsoqHoldingScript(scriptPubKey);
+
+  /// Whether this output carries USDSOQ — by witness version (v7) OR the legacy
+  /// nAssetType byte. The byte path is a TRANSITION dual-signal; post-Phase-4 (byte
+  /// removed, and the byte-derived RPC `assetType` field gone) the version path is the
+  /// sole classifier — which is why this must NOT rely on `assetType == 1` alone.
+  bool get isUsdsoq => isV7UsdsoqHolding || assetType == 1;
+
+  /// True if [scriptPubKeyHex] is a v7 USDSOQ holding: OP_7 (0x57) || PUSH_32 (0x20) ||
+  /// 32-byte program = 34 bytes (68 hex chars). Reusable so balance/UTXO classification
+  /// across the wallet agrees with consensus on the new type.
+  static bool isV7UsdsoqHoldingScript(String scriptPubKeyHex) {
+    if (scriptPubKeyHex.length != 68) return false;
+    return scriptPubKeyHex.substring(0, 4).toLowerCase() == '5720';
+  }
 
   /// Whether this output is confidential (Lattice-BP++ hidden amount).
   bool get isConfidential => visibility == 1;

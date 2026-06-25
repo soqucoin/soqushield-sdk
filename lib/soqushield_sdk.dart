@@ -13,7 +13,6 @@
 /// - **Address** — Soqucoin Bech32m address encoding/decoding with PQ
 ///   witness program support.
 /// - **RPC** — Typed client for the Soqucoin node JSON-RPC interface.
-/// - **Vault** — pSOQ↔SOQ bridge vault operations with ML-DSA-44 signing.
 ///
 /// ## Quick Start
 ///
@@ -63,8 +62,8 @@ export 'src/address/address_codec.dart';
 export 'src/rpc/rpc_client.dart';
 export 'src/rpc/rpc_models.dart' hide TxOutput;
 
-// Vault bridge
-export 'src/vault/vault_client.dart';
+// Lightning (eLTOO, quantum-safe) — LSP client + SoqLightning facade + swappable TX builder
+export 'src/lightning/lightning.dart';
 
 // High-level wallet
 export 'src/wallet.dart';
