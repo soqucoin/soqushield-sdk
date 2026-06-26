@@ -1,0 +1,26 @@
+# Dart CI — analyze + test the SoquShield SDK on every PR / push to main.
+#
+# The dilithium_native FFI interop test (test/dilithium_native_interop_test.dart) is excluded:
+# it loads the compiled native ML-DSA-44 library, which isn't built in this hosted runner. The
+# rest of the suite runs here — eltoo primitives, the broadcast/LSP-round layer, and the
+# SoqLightning facade — which validates the Dart logic (the FFI direction is covered locally /
+# by the vector_mldsa workstream).
+name: dart
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dart-lang/setup-dart@v1
+      - name: Install dependencies
+        run: dart pub get
+      - name: Analyze
+        run: dart analyze
+      - name: Test (excludes the native-FFI interop test)
+        run: dart test test/eltoo test/lightning_test.dart test/transaction_v7_test.dart

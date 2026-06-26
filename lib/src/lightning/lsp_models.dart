@@ -192,13 +192,15 @@ class UpdateStateReq {
 class UpdateStateResp {
   final bool accepted;
   final String? rejectReason;
-  final String? peerSignatureHex; // "countersigned" on success
+  final String? peerSignatureHex; // 2421-byte LSP partial on the UPDATE (real ML-DSA once WS2b deployed)
+  final String? settlementSignatureHex; // F1: 2421-byte LSP partial on the SETTLEMENT — needed to close (spec §E)
   final UpdateStateEcho? echo;
 
   const UpdateStateResp({
     required this.accepted,
     this.rejectReason,
     this.peerSignatureHex,
+    this.settlementSignatureHex,
     this.echo,
   });
 
@@ -206,6 +208,7 @@ class UpdateStateResp {
         accepted: json['accepted'] as bool? ?? false,
         rejectReason: json['reject_reason'] as String?,
         peerSignatureHex: json['peer_signature_hex'] as String?,
+        settlementSignatureHex: json['settlement_signature_hex'] as String?,
         echo: json['echo'] is Map<String, dynamic>
             ? UpdateStateEcho.fromJson(json['echo'] as Map<String, dynamic>)
             : null,

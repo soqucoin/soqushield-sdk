@@ -18,11 +18,42 @@
 // clamp, dropped-close resilience) are the ones VERIFIED LIVE against the stagenet LSP on
 // 2026-06-24 — keep them.
 
+import 'dart:typed_data';
+
 import 'package:dio/dio.dart';
 
+import 'eltoo/broadcaster.dart';
+import 'eltoo/ctv.dart';
+import 'eltoo/serialization.dart';
+import 'eltoo/sighash.dart';
 import 'lsp_client.dart';
 import 'lsp_models.dart';
+import 'two_party_round.dart';
 import 'update_tx_builder.dart';
+
+/// Everything the SDK needs to co-sign + self-custody a channel that the LSP-side facade does
+/// NOT hold: the user's key, the funding outpoint (tracked at open), the on-chain payout scripts,
+/// the fee, and the ML-DSA signer. Supplied per call so the demo [SoqLightning.pay] path stays
+/// key-free.
+class SelfCustodyContext {
+  final Uint8List userSecretKey;
+  final Uint8List userPub; // MUST equal fromHex(channel.initiatorPubKeyHex)
+  final OutPoint funding; // the channel's funding outpoint (internal byte order)
+  final Uint8List initiatorScriptPubKey; // the user's on-chain settlement payout
+  final Uint8List peerScriptPubKey; // the LSP's on-chain settlement payout
+  final BigInt feeSat; // fixed per-tx fee (v1, spec §H)
+  final MlDsaSign sign; // ML-DSA-44 signer (e.g. DilithiumNative.instance.sign)
+
+  const SelfCustodyContext({
+    required this.userSecretKey,
+    required this.userPub,
+    required this.funding,
+    required this.initiatorScriptPubKey,
+    required this.peerScriptPubKey,
+    required this.feeSat,
+    required this.sign,
+  });
+}
 
 /// Optional watchtower arming hook (spec §1.6 persist→arm→ack). On stagenet the LSP arms the
 /// firewalled dual towers on the spoke's behalf, so this is unused by default; it exists so
@@ -194,6 +225,81 @@ class SoqLightning {
       throw StateError('balance not conserved after update');
     }
     return after;
+  }
+
+  /// Self-custodial pay — one F1-complete LSP round (spec §D + §E). Moves [amountSat] to the peer
+  /// and returns the fully-signed (Tu, Ts) the caller MUST persist: with them the user can
+  /// unilaterally close WITHOUT the LSP. Unlike [pay] (the demo/opaque path) this does real
+  /// 2-of-2 co-signing — the user signs locally; the LSP returns BOTH partials; they're combined.
+  ///
+  /// Balance/fee model: the LSP accounts LOGICAL balances (sum == capacity, `manager.go:271`), but
+  /// the on-chain settlement can only pay capacity − 2·fee (one fee for the update tx, one for the
+  /// settlement). ⚠️ v1 policy (§H — FLAG): the INITIATOR pays both on-chain force-close fees (the
+  /// LN default), so its settlement output = logical balance − 2·fee. Revisit when fee policy lands.
+  ///
+  /// ⚠️ TRUST GAP (WS2b Task 7): the LSP co-signs the settlement WITHOUT validating its outputs
+  /// match the recorded balances — a malicious spoke could over-pay itself. Safe only until the
+  /// LSP enforces settlement-output validation.
+  Future<({LnChannel channel, SignedTx update, SignedTx settlement})> selfCustodialPay(
+      String channelId, int amountSat, SelfCustodyContext ctx) async {
+    if (amountSat <= 0) throw ArgumentError('amount must be positive');
+    final ch = await client.getChannel(channelId);
+    if (ch.state != 'open') throw StateError('channel not open (state=${ch.state})');
+    if (amountSat > ch.initiatorBalanceSat) throw StateError('insufficient initiator balance');
+
+    final lspPub = fromHex(ch.peerPubKeyHex);
+    final bc = EltooBroadcaster(ChannelParams(
+      funding: ctx.funding,
+      capacitySat: BigInt.from(ch.capacitySat),
+      initiatorPub: ctx.userPub,
+      peerPub: lspPub,
+      initiatorScriptPubKey: ctx.initiatorScriptPubKey,
+      peerScriptPubKey: ctx.peerScriptPubKey,
+      settlementCsv: ch.csvDelay,
+      feeSat: ctx.feeSat,
+    ));
+
+    // Logical balances after the payment (sum == capacity, for the LSP), then the on-chain
+    // settlement split: the initiator absorbs the 2·fee force-close cost.
+    final logicalInitiator = ch.initiatorBalanceSat - amountSat;
+    final logicalPeer = ch.peerBalanceSat + amountSat;
+    final settlementInitiator = BigInt.from(logicalInitiator) - BigInt.two * ctx.feeSat;
+    if (settlementInitiator < BigInt.zero) {
+      throw StateError(
+          'initiator balance $logicalInitiator cannot cover ${BigInt.two * ctx.feeSat} on-chain fees');
+    }
+
+    final round = await lspUpdateRound(
+      bc,
+      (req) => client.updateState(channelId, req),
+      stateNum: ch.stateIndex + 1,
+      initiatorBalanceSat: settlementInitiator,
+      peerBalanceSat: BigInt.from(logicalPeer),
+      reqBalances: (initiatorSat: logicalInitiator, peerSat: logicalPeer),
+      userSecretKey: ctx.userSecretKey,
+      userPub: ctx.userPub,
+      lspPub: lspPub,
+      mldsa: ctx.sign,
+    );
+
+    // §1.6 persist→arm→ack: arm the watchtower with the FULLY-SIGNED txs that will broadcast.
+    final wt = _watchtower;
+    if (wt != null) {
+      await wt.arm(
+        channelId: channelId,
+        fundingTxid: toHex(reversed(ctx.funding.txid)),
+        fundingVout: ctx.funding.n,
+        stateIndex: ch.stateIndex + 1,
+        tx: UpdateTx(
+          updateTxHex: round.update.hex,
+          settlementTxHex: round.settlement.hex,
+          ctvHash: toHex(ctvHash(round.settlement.tx, 0)),
+        ),
+      );
+    }
+
+    final after = await client.getChannel(channelId);
+    return (channel: after, update: round.update, settlement: round.settlement);
   }
 
   /// Cooperative close → L1 settlement enqueued via the LSP.

@@ -15,3 +15,5 @@ export 'lsp_models.dart';
 export 'lsp_client.dart';
 export 'update_tx_builder.dart';
 export 'soq_lightning.dart';
+export 'two_party_round.dart';
+export 'eltoo/eltoo.dart';
