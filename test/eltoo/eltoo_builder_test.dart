@@ -8,7 +8,6 @@
 
 import 'dart:typed_data';
 
-import 'package:soqushield_sdk/eltoo.dart';
 import 'package:soqushield_sdk/lightning.dart';
 import 'package:test/test.dart';
 
