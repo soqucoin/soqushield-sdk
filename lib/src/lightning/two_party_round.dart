@@ -134,3 +134,123 @@ Future<({SignedTx update, SignedTx settlement})> lspUpdateRound(
     lspSettleSigHex: resp.settlementSignatureHex!,
   );
 }
+
+/// The self-funded-open round-trip (in production: `LspClient.selfFundedOpen`). Injectable so the
+/// round is testable with a mock LSP. The response MUST carry BOTH partials.
+typedef SelfFundedOpenFn = Future<SelfFundedOpenResp> Function(SelfFundedOpenReq req);
+
+/// The fully-signed product of a self-funded open: the channel id plus the broadcastable state-0
+/// (Tu, Ts). The user persists these so it can unilaterally exit (broadcast [update] then, after
+/// the CSV delay, [settlement]) WITHOUT the LSP — the whole point of self-custody.
+class SelfFundedOpenResult {
+  final String channelId;
+  final SignedTx update; // state-0 Tu (funding 2-of-2 → eLTOO(0))
+  final SignedTx settlement; // state-0 Ts (full refund to the initiator)
+  final String peerPubKeyHex; // the LSP's channel key
+  final String? peerAddress;
+  final String fundingScriptPubKeyHex; // the 2-of-2 scriptPubKey the funding output MUST pay
+
+  const SelfFundedOpenResult({
+    required this.channelId,
+    required this.update,
+    required this.settlement,
+    required this.peerPubKeyHex,
+    required this.peerAddress,
+    required this.fundingScriptPubKeyHex,
+  });
+}
+
+/// Gate 2: the self-custodial channel-OPEN round (spec §3.2, bead pw2). The mirror of
+/// [lspUpdateRound] for state 0, where the channel is funded by a USER-CONTROLLED 2-of-2 the user
+/// has BUILT but not yet broadcast. The user constructs the state-0 update + full-refund
+/// settlement against [bc]'s funding outpoint, signs its own partials, POSTs them, and the LSP
+/// returns its two partials; this stitches them into the fully-signed (Tu, Ts) the user persists.
+///
+/// CRITICAL ORDERING (the caller MUST honor): build the funding tx → call this → ONLY on success
+/// broadcast the funding tx → poll `confirmFunding`. Broadcasting the funding BEFORE the LSP
+/// accepts is a FUND-LOSS TRAP (funds locked in a 2-of-2 the LSP never agreed to co-sign).
+///
+/// [bc] MUST be built with initiatorPub = [userPub], peerPub = [lspPub], and the funding outpoint
+/// set to the (display→internal) txid:vout of the unbroadcast funding tx, with capacitySat = the
+/// funding output value. Throws if the LSP rejects, omits a partial, or would fund a different
+/// 2-of-2 than the user (a wrong/stale [lspPub] — caught BEFORE the caller broadcasts).
+Future<SelfFundedOpenResult> selfFundedOpenRound(
+  EltooBroadcaster bc,
+  SelfFundedOpenFn open, {
+  required String fundingTxidDisplay,
+  required int fundingVout,
+  required int csvDelay,
+  required String initiatorPubKeyHex,
+  required String initiatorAddress,
+  required Uint8List userSecretKey,
+  required Uint8List userPub,
+  required Uint8List lspPub,
+  required MlDsaSign mldsa,
+}) async {
+  if (fundingTxidDisplay.length != 64) {
+    throw ArgumentError(
+        'fundingTxidDisplay must be a 64-char display-order txid, got ${fundingTxidDisplay.length}');
+  }
+
+  // State 0: funding 2-of-2 → update (locktime 1) → single-output full-refund settlement.
+  final updateTx = bc.buildFundingUpdateTx(0);
+  final updateValueSat = updateTx.vout[0].value;
+  final settlementTx = bc.buildRefundSettlementTx(
+    updateOutpoint: OutPoint(txidInternal(updateTx), 0),
+    updateValueSat: updateValueSat,
+  );
+
+  // The user signs ITS partials before handing the txs to the LSP. The update spends the funding
+  // 2-of-2 (0x42 amount = capacity); the settlement spends the update output (amount = updateValue).
+  final userUpdate = bc.signFundingPartial(updateTx, userSecretKey, userPub, mldsa);
+  final userSettle =
+      bc.signEltooPartial(settlementTx, updateValueSat, userSecretKey, userPub, mldsa);
+
+  final resp = await open(SelfFundedOpenReq(
+    initiatorPubKeyHex: initiatorPubKeyHex,
+    capacitySat: bc.p.capacitySat.toInt(),
+    csvDelay: csvDelay,
+    initiatorAddress: initiatorAddress,
+    fundingTxid: fundingTxidDisplay,
+    fundingVout: fundingVout,
+    updateTxHex: serializeTxHex(updateTx),
+    settlementTxHex: serializeTxHex(settlementTx),
+    ctvHash: toHex(ctvHash(settlementTx, 0)),
+  ));
+  if (!resp.accepted) {
+    throw StateError('LSP rejected self-funded open: ${resp.rejectReason ?? "unknown"}');
+  }
+  if (resp.channelId == null) {
+    throw StateError('LSP accepted the self-funded open but returned no channel_id');
+  }
+  if (resp.peerSignatureHex == null || resp.settlementSignatureHex == null) {
+    throw StateError(
+        'LSP did not return BOTH partials (peer_signature_hex / settlement_signature_hex) — the '
+        'user cannot self-custodially exit without them (self-funded co-sign not deployed?).');
+  }
+
+  // Safety gate BEFORE the caller broadcasts: the LSP recomputed the 2-of-2 scriptPubKey from its
+  // OWN peer key. If it differs from the one the user funds, the funding output is unspendable.
+  final localSpk = toHex(keyhashFunding2of2(userPub, lspPub).scriptPubKey);
+  if (resp.fundingScriptPubKeyHex != null &&
+      resp.fundingScriptPubKeyHex!.toLowerCase() != localSpk.toLowerCase()) {
+    throw StateError(
+        'funding scriptPubKey mismatch: the LSP would fund a different 2-of-2 than the user '
+        '(is lspPub the LSP\'s current peer key?). Do NOT broadcast the funding tx.');
+  }
+
+  final update =
+      bc.assembleFundingSpend(updateTx, [userUpdate, _lspPartial(lspPub, resp.peerSignatureHex!)]);
+  // The settlement spends the state-0 update output via its ELSE/CSV branch.
+  final settlement = bc.assembleSettlement(
+      settlementTx, 0, [userSettle, _lspPartial(lspPub, resp.settlementSignatureHex!)]);
+
+  return SelfFundedOpenResult(
+    channelId: resp.channelId!,
+    update: update,
+    settlement: settlement,
+    peerPubKeyHex: resp.peerPubKeyHex ?? toHex(lspPub),
+    peerAddress: resp.peerAddress,
+    fundingScriptPubKeyHex: resp.fundingScriptPubKeyHex ?? localSpk,
+  );
+}

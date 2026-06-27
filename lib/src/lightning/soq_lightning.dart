@@ -90,6 +90,38 @@ class OpenChannelParams {
   });
 }
 
+/// Parameters for a self-custodial (user-funded) channel open — the inputs the SDK needs to
+/// build + co-sign the state-0 (Tu, Ts) against a 2-of-2 the user controls. The funding tx itself
+/// is built + broadcast by the CALLER (the wallet's L1 tx builder), not the SDK; see
+/// [SoqLightning.selfFundedOpen] for the required ordering.
+class SelfFundedOpenParams {
+  final String fundingTxid; // DISPLAY-order txid of the unbroadcast funding tx
+  final int fundingVout; // the 2-of-2 output index in that funding tx
+  final int capacitySat; // MUST equal the funding output value
+  final String userPubKeyHex; // initiator ML-DSA-44 pub (2624 hex chars)
+  final String lspPubKeyHex; // the LSP peer pub used to build the 2-of-2 (from info()['pub_key_hex'])
+  final String initiatorAddress; // L1 settlement payout address (cooperative close)
+  final Uint8List initiatorScriptPubKey; // the user's settlement payout scriptPubKey
+  final Uint8List userSecretKey; // ML-DSA-44 secret key (on-device)
+  final MlDsaSign sign; // ML-DSA-44 signer
+  final int csvDelay; // settlement CSV tier the LSP accepts (e.g. 144 or 288)
+  final BigInt feeSat; // fixed per-tx on-chain fee (v1, spec §H)
+
+  const SelfFundedOpenParams({
+    required this.fundingTxid,
+    required this.fundingVout,
+    required this.capacitySat,
+    required this.userPubKeyHex,
+    required this.lspPubKeyHex,
+    required this.initiatorAddress,
+    required this.initiatorScriptPubKey,
+    required this.userSecretKey,
+    required this.sign,
+    required this.csvDelay,
+    required this.feeSat,
+  });
+}
+
 class SoqLightning {
   final LspClient client;
   final UpdateTxBuilder _builder;
@@ -301,6 +333,60 @@ class SoqLightning {
     final after = await client.getChannel(channelId);
     return (channel: after, update: round.update, settlement: round.settlement);
   }
+
+  /// Gate 2 — open a SELF-CUSTODIAL channel funded by a 2-of-2 the user controls (spec §3.2).
+  /// Returns the channel id + the fully-signed state-0 (Tu, Ts) the caller MUST persist: with them
+  /// the user can unilaterally exit (force-close) WITHOUT the LSP — the property [openChannel]/
+  /// [fundAndOpen] (LSP-hosted) do NOT give. Combine with [selfCustodialPay] for subsequent states.
+  ///
+  /// The funding tx is the CALLER's responsibility (the wallet's L1 builder), and the ORDER is
+  /// load-bearing:
+  ///   1. Build (do NOT broadcast) a funding tx paying [SelfFundedOpenParams.capacitySat] to the
+  ///      witness-v6 2-of-2 of (userPub, lspPub) at vout [SelfFundedOpenParams.fundingVout]. The
+  ///      2-of-2 scriptPubKey is `p2wshV6(keyhashFunding2of2(userPub, lspPub).witnessScript)`.
+  ///   2. Call this — it validates, co-signs, and (via the returned [SelfFundedOpenResult]) lets
+  ///      you verify the LSP funds the SAME 2-of-2 you built (mismatch ⇒ it throws, so you never
+  ///      broadcast into an unspendable output).
+  ///   3. ONLY on success, broadcast the funding tx.
+  ///   4. Poll [confirmFunding] until [ConfirmFundingResp.isOpen].
+  /// Broadcasting before step 2 succeeds is a FUND-LOSS TRAP. [lspPubKeyHex] MUST be the same key
+  /// used to build the funding 2-of-2 (fetch once via `info()['pub_key_hex']`).
+  Future<SelfFundedOpenResult> selfFundedOpen(SelfFundedOpenParams p) async {
+    final userPub = fromHex(p.userPubKeyHex);
+    final lspPub = fromHex(p.lspPubKeyHex);
+    final bc = EltooBroadcaster(ChannelParams(
+      funding: OutPoint.fromTxidHex(p.fundingTxid, p.fundingVout),
+      capacitySat: BigInt.from(p.capacitySat),
+      initiatorPub: userPub,
+      peerPub: lspPub,
+      initiatorScriptPubKey: p.initiatorScriptPubKey,
+      // Unused at state 0: the full-refund settlement has a single output to the initiator, and the
+      // LSP's settlement payout isn't known until later states. Real peer payouts arrive via pay().
+      peerScriptPubKey: Uint8List(0),
+      settlementCsv: p.csvDelay,
+      feeSat: p.feeSat,
+    ));
+
+    return selfFundedOpenRound(
+      bc,
+      (req) => client.selfFundedOpen(req),
+      fundingTxidDisplay: p.fundingTxid,
+      fundingVout: p.fundingVout,
+      csvDelay: p.csvDelay,
+      initiatorPubKeyHex: p.userPubKeyHex,
+      initiatorAddress: p.initiatorAddress,
+      userSecretKey: p.userSecretKey,
+      userPub: userPub,
+      lspPub: lspPub,
+      mldsa: p.sign,
+    );
+  }
+
+  /// Confirm a self-funded channel on-chain after the funding tx is broadcast (step 4 above). One
+  /// poll: returns the current confirmations and whether the LSP has promoted the channel to OPEN.
+  /// The caller drives the poll cadence (re-call until [ConfirmFundingResp.isOpen]).
+  Future<ConfirmFundingResp> confirmFunding(String channelId, String fundingTxid) =>
+      client.confirmFunding(channelId, ConfirmFundingReq(fundingTxid: fundingTxid));
 
   /// Cooperative close → L1 settlement enqueued via the LSP.
   ///

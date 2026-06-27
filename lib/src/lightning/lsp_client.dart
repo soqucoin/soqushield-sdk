@@ -119,6 +119,18 @@ class LspClient {
       UpdateStateResp.fromJson(
           await _reqMap('POST', '/v1/channels/$id/update', req.toJson()));
 
+  /// POST /v1/channels/self-funded — open a channel against a user-provided 2-of-2 funding
+  /// outpoint (the self-custodial path). The LSP validates the state-0 txs and co-signs both.
+  Future<SelfFundedOpenResp> selfFundedOpen(SelfFundedOpenReq req) async =>
+      SelfFundedOpenResp.fromJson(
+          await _reqMap('POST', '/v1/channels/self-funded', req.toJson()));
+
+  /// POST /v1/channels/{id}/funded — confirm a self-funded channel on-chain (call after the
+  /// funding tx is broadcast; poll until [ConfirmFundingResp.isOpen]).
+  Future<ConfirmFundingResp> confirmFunding(String id, ConfirmFundingReq req) async =>
+      ConfirmFundingResp.fromJson(
+          await _reqMap('POST', '/v1/channels/$id/funded', req.toJson()));
+
   Future<CloseResp> closeChannel(String id) async =>
       CloseResp.fromJson(await _reqMap('POST', '/v1/channels/$id/close'));
 

@@ -13,6 +13,7 @@
 import 'dart:typed_data';
 
 import 'package:soqushield_sdk/src/lightning/eltoo/broadcaster.dart';
+import 'package:soqushield_sdk/src/lightning/eltoo/keyhash.dart';
 import 'package:soqushield_sdk/src/lightning/eltoo/script.dart';
 import 'package:soqushield_sdk/src/lightning/eltoo/serialization.dart';
 import 'package:soqushield_sdk/src/lightning/lsp_models.dart';
@@ -252,6 +253,142 @@ void main() {
       expect(captured!.initiatorBalanceSat, logicalInit);
       // settlement outputs are fee-deducted (sum = capacity - 2*fee).
       expect(round.settlement.tx.vout[0].value + round.settlement.tx.vout[1].value, cap - BigInt.two * fee);
+    });
+  });
+
+  group('selfFundedOpenRound (Gate 2 self-custodial open)', () {
+    const fundingTxidDisplay =
+        'aa00112233445566778899aabbccddeeff00112233445566778899aabbccddee';
+    const fundingVout = 0;
+    const channelId = 'c0ffee';
+    const peerAddr = 'soq1peeraddr';
+    final realFundingSpk = toHex(keyhashFunding2of2(userPub, lspPub).scriptPubKey);
+
+    // Like params(), but the funding outpoint is derived from the declared display-order txid (as
+    // the real facade does) and peerScriptPubKey is empty (unused at state 0). This keeps the
+    // update TX's prevout consistent with fundingTxidDisplay end-to-end.
+    ChannelParams sfParams() => ChannelParams(
+          funding: OutPoint.fromTxidHex(fundingTxidDisplay, fundingVout),
+          capacitySat: cap,
+          initiatorPub: userPub,
+          peerPub: lspPub,
+          initiatorScriptPubKey: spkA,
+          peerScriptPubKey: Uint8List(0),
+          settlementCsv: csv,
+          feeSat: fee,
+        );
+
+    // A mock LSP that rebuilds the state-0 txs and co-signs BOTH with its key. The settlement is
+    // co-signed over the UPDATE-OUTPUT value (capacity − fee), NOT capacity — the 0x42 sighash
+    // commits the amount (mirrors the live LSP's UpdateOutputValue path).
+    SelfFundedOpenFn mockLsp({
+      bool omitSettlement = false,
+      String? fundingSpkOverride,
+      void Function(SelfFundedOpenReq)? capture,
+    }) =>
+        (SelfFundedOpenReq req) async {
+          capture?.call(req);
+          final bc = EltooBroadcaster(sfParams());
+          final updateTx = bc.buildFundingUpdateTx(0);
+          final uValue = updateTx.vout[0].value;
+          final settleTx = bc.buildRefundSettlementTx(
+            updateOutpoint: OutPoint(txidInternal(updateTx), 0),
+            updateValueSat: uValue,
+          );
+          final up = bc.signFundingPartial(updateTx, skB, lspPub, mockSign);
+          final st = bc.signEltooPartial(settleTx, uValue, skB, lspPub, mockSign);
+          return SelfFundedOpenResp(
+            accepted: true,
+            channelId: channelId,
+            peerPubKeyHex: toHex(lspPub),
+            peerAddress: peerAddr,
+            peerSignatureHex: toHex(up.sig),
+            settlementSignatureHex: omitSettlement ? null : toHex(st.sig),
+            fundingScriptPubKeyHex: fundingSpkOverride ?? realFundingSpk,
+            state: 'pending_funding',
+          );
+        };
+
+    Future<SelfFundedOpenResult> run(SelfFundedOpenFn lsp) => selfFundedOpenRound(
+          EltooBroadcaster(sfParams()),
+          lsp,
+          fundingTxidDisplay: fundingTxidDisplay,
+          fundingVout: fundingVout,
+          csvDelay: csv,
+          initiatorPubKeyHex: toHex(userPub),
+          initiatorAddress: 'soq1useraddr',
+          userSecretKey: skA,
+          userPub: userPub,
+          lspPub: lspPub,
+          mldsa: mockSign,
+        );
+
+    test('stitches both partials → broadcastable state-0 (Tu, Ts); settlement is a single refund',
+        () async {
+      final r = await run(mockLsp());
+      expect(r.channelId, channelId);
+      expect(r.peerAddress, peerAddr);
+      expect(r.fundingScriptPubKeyHex, realFundingSpk);
+      expect(r.update.hex.startsWith('020000000001'), isTrue);
+      expect(r.settlement.hex.startsWith('020000000001'), isTrue);
+      // state-0 update: locktime 1, value capacity − fee.
+      expect(r.update.tx.locktime, 1);
+      expect(r.update.tx.vout.single.value, cap - fee);
+      // settlement is a SINGLE full-refund output = capacity − 2·fee, sequence = csv, chains to Tu.
+      expect(r.settlement.tx.vout.length, 1);
+      expect(r.settlement.tx.vout.single.value, cap - BigInt.two * fee);
+      expect(r.settlement.tx.vin.single.sequence, csv);
+      expect(r.settlement.tx.vin[0].prevout.txid, r.update.txid);
+    });
+
+    test('LSP request carries capacity + display-order funding outpoint; update prevout matches',
+        () async {
+      SelfFundedOpenReq? captured;
+      await run(mockLsp(capture: (req) => captured = req));
+      expect(captured!.capacitySat, cap.toInt());
+      expect(captured!.fundingTxid, fundingTxidDisplay);
+      expect(captured!.fundingVout, fundingVout);
+      // The update TX the LSP receives must spend the declared funding outpoint (F3 / byte order):
+      // its vin[0] prevout, reversed to display order, equals the funding txid sent.
+      final updatePrevoutDisplay =
+          toHex(reversed(EltooBroadcaster(sfParams()).buildFundingUpdateTx(0).vin[0].prevout.txid));
+      expect(updatePrevoutDisplay, fundingTxidDisplay);
+    });
+
+    test('throws if the LSP omits the settlement partial (self-custody exit impossible)', () {
+      expect(() => run(mockLsp(omitSettlement: true)), throwsStateError);
+    });
+
+    test('throws on a funding scriptPubKey mismatch BEFORE the caller broadcasts (wrong lspPub)',
+        () {
+      expect(() => run(mockLsp(fundingSpkOverride: '00' * 34)), throwsStateError);
+    });
+
+    test('rejects a non-64-char funding txid (display/internal order guard)', () {
+      expect(
+          () => selfFundedOpenRound(
+                EltooBroadcaster(params()),
+                mockLsp(),
+                fundingTxidDisplay: 'deadbeef',
+                fundingVout: fundingVout,
+                csvDelay: csv,
+                initiatorPubKeyHex: toHex(userPub),
+                initiatorAddress: 'soq1useraddr',
+                userSecretKey: skA,
+                userPub: userPub,
+                lspPub: lspPub,
+                mldsa: mockSign,
+              ),
+          throwsArgumentError);
+    });
+
+    test('throws if the LSP rejects the open', () {
+      expect(
+          () => run((req) async => const SelfFundedOpenResp(
+                accepted: false,
+                rejectReason: 'capacity exceeds max',
+              )),
+          throwsStateError);
     });
   });
 }
