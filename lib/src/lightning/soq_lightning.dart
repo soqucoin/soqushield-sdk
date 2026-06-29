@@ -269,9 +269,11 @@ class SoqLightning {
   /// settlement). ⚠️ v1 policy (§H — FLAG): the INITIATOR pays both on-chain force-close fees (the
   /// LN default), so its settlement output = logical balance − 2·fee. Revisit when fee policy lands.
   ///
-  /// ⚠️ TRUST GAP (WS2b Task 7): the LSP co-signs the settlement WITHOUT validating its outputs
-  /// match the recorded balances — a malicious spoke could over-pay itself. Safe only until the
-  /// LSP enforces settlement-output validation.
+  /// Trust model (Task 7, bead m91 — CLOSED): two independent guards now bound over-pay. (1) The
+  /// user builds Ts LOCALLY here (settlement output = own balance − 2·fee), so the LSP only returns
+  /// a co-sign PARTIAL over the user-chosen sighash — it cannot redirect outputs. (2) The LSP
+  /// independently REJECTS any settlement whose outputs exceed the recorded balances or capacity
+  /// (manager.go validateAndApplyUpdate), so a malicious spoke cannot over-pay itself either.
   Future<({LnChannel channel, SignedTx update, SignedTx settlement})> selfCustodialPay(
       String channelId, int amountSat, SelfCustodyContext ctx) async {
     if (amountSat <= 0) throw ArgumentError('amount must be positive');
