@@ -259,6 +259,113 @@ class SoqLightning {
     return after;
   }
 
+  // ─── Invoice rail (custodial receive — INVOICE_RAIL_SPEC.md) ───
+
+  /// Parse a `soqln:` invoice URI to its invoice id, or null if malformed.
+  /// Accepts the v1 bare form `soqln:<64-hex-id>` and the forward-compatible
+  /// `soqln:<host>/<64-hex-id>` (host ignored — single-LSP v1).
+  static String? parseInvoiceUri(String input) {
+    var s = input.trim();
+    if (!s.toLowerCase().startsWith('soqln:')) return null;
+    s = s.substring(6);
+    final slash = s.lastIndexOf('/');
+    if (slash >= 0) s = s.substring(slash + 1);
+    s = s.toLowerCase();
+    if (s.length != 64) return null;
+    for (final c in s.codeUnits) {
+      final hexDigit = (c >= 0x30 && c <= 0x39) || (c >= 0x61 && c <= 0x66);
+      if (!hexDigit) return null;
+    }
+    return s;
+  }
+
+  /// Create a pending invoice for [amountSat] on the payee's hosted [channelId].
+  /// Share the returned [LnInvoice.uri] (QR/copy) with the payer.
+  Future<LnInvoice> createInvoice(
+    String channelId,
+    int amountSat, {
+    String memo = '',
+    int expirySeconds = 0,
+  }) async {
+    if (amountSat <= 0) throw ArgumentError('amount must be positive');
+    return client.createInvoice(CreateInvoiceReq(
+      channelId: channelId,
+      amountSat: amountSat,
+      memo: memo,
+      expirySeconds: expirySeconds,
+    ));
+  }
+
+  /// Fetch an invoice's current status.
+  Future<LnInvoice> invoice(String invoiceId) => client.getInvoice(invoiceId);
+
+  /// Pay an invoice from [channelId]: builds the eLTOO state update moving
+  /// exactly the invoice amount initiator→peer (same construction as [pay])
+  /// and settles it through the invoice endpoint, so the LSP atomically
+  /// credits the payee. Returns the updated payer channel and the paid invoice.
+  Future<({LnChannel channel, LnInvoice invoice})> payInvoice(
+    String invoiceId,
+    String channelId,
+  ) async {
+    final inv = await client.getInvoice(invoiceId);
+    if (!inv.isPending) throw StateError('invoice is ${inv.status}');
+
+    final ch = await client.getChannel(channelId);
+    if (ch.state != 'open') throw StateError('channel not open (state=${ch.state})');
+    if (inv.amountSat > ch.initiatorBalanceSat) {
+      throw StateError('insufficient initiator balance');
+    }
+
+    final next = UpdateContext(
+      channel: ch,
+      nextStateIndex: ch.stateIndex + 1,
+      nextInitiatorBalanceSat: ch.initiatorBalanceSat - inv.amountSat,
+      nextPeerBalanceSat: ch.peerBalanceSat + inv.amountSat,
+    );
+    final tx = await _builder.build(next);
+    final resp = await client.payInvoice(
+      invoiceId,
+      PayInvoiceReq(
+        channelId: channelId,
+        stateIndex: next.nextStateIndex,
+        initiatorBalanceSat: next.nextInitiatorBalanceSat,
+        peerBalanceSat: next.nextPeerBalanceSat,
+        updateTxHex: tx.updateTxHex,
+        settlementTxHex: tx.settlementTxHex,
+        ctvHash: tx.ctvHash,
+      ),
+    );
+    if (!resp.accepted) {
+      throw StateError('invoice pay rejected: ${resp.rejectReason ?? "unknown"}');
+    }
+
+    final after = await client.getChannel(channelId);
+    if (after.stateIndex <= ch.stateIndex) {
+      throw StateError('state did not advance: ${ch.stateIndex} -> ${after.stateIndex}');
+    }
+    if (after.initiatorBalanceSat + after.peerBalanceSat != after.capacitySat) {
+      throw StateError('balance not conserved after invoice pay');
+    }
+    return (channel: after, invoice: resp.invoice ?? inv);
+  }
+
+  /// Poll an invoice until it leaves `pending` (paid or expired) or [timeout]
+  /// elapses. Returns the terminal invoice; on timeout returns the last-seen
+  /// (still pending) invoice — check [LnInvoice.isPaid].
+  Future<LnInvoice> awaitInvoicePaid(
+    String invoiceId, {
+    Duration interval = const Duration(seconds: 2),
+    Duration timeout = const Duration(minutes: 10),
+  }) async {
+    final deadline = DateTime.now().add(timeout);
+    var inv = await client.getInvoice(invoiceId);
+    while (inv.isPending && DateTime.now().isBefore(deadline)) {
+      await Future<void>.delayed(interval);
+      inv = await client.getInvoice(invoiceId);
+    }
+    return inv;
+  }
+
   /// Self-custodial pay — one F1-complete LSP round (spec §D + §E). Moves [amountSat] to the peer
   /// and returns the fully-signed (Tu, Ts) the caller MUST persist: with them the user can
   /// unilaterally close WITHOUT the LSP. Unlike [pay] (the demo/opaque path) this does real

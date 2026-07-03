@@ -450,3 +450,133 @@ class TowerProxyStatus {
             .toList(),
       );
 }
+
+// ─── Invoice rail (INVOICE_RAIL_SPEC.md) ───
+
+/// A payee's request for a fixed amount on a hosted channel, settled custodially
+/// by the LSP hub (payer channel debited, payee channel credited, atomically).
+class LnInvoice {
+  final String invoiceId;
+  final String uri; // soqln:<invoice_id>
+  final String channelId; // payee channel
+  final int amountSat;
+  final String memo;
+  final String status; // pending | paid | expired
+  final String createdAt; // RFC3339
+  final String expiresAt; // RFC3339
+  final String? paidAt; // RFC3339, set when paid
+  final String? payerChannelId; // set when paid
+
+  const LnInvoice({
+    required this.invoiceId,
+    required this.uri,
+    required this.channelId,
+    required this.amountSat,
+    required this.memo,
+    required this.status,
+    required this.createdAt,
+    required this.expiresAt,
+    this.paidAt,
+    this.payerChannelId,
+  });
+
+  bool get isPending => status == 'pending';
+  bool get isPaid => status == 'paid';
+  bool get isExpired => status == 'expired';
+
+  factory LnInvoice.fromJson(Map<String, dynamic> json) => LnInvoice(
+        invoiceId: json['invoice_id'] as String? ?? '',
+        uri: json['uri'] as String? ?? '',
+        channelId: json['channel_id'] as String? ?? '',
+        amountSat: (json['amount_sat'] as num?)?.toInt() ?? 0,
+        memo: json['memo'] as String? ?? '',
+        status: json['status'] as String? ?? '',
+        createdAt: json['created_at'] as String? ?? '',
+        expiresAt: json['expires_at'] as String? ?? '',
+        paidAt: json['paid_at'] as String?,
+        payerChannelId: json['payer_channel_id'] as String?,
+      );
+}
+
+/// Request to create an invoice (payee side).
+class CreateInvoiceReq {
+  final String channelId;
+  final int amountSat;
+  final String memo;
+  final int expirySeconds; // 0 = LSP default (1h)
+
+  const CreateInvoiceReq({
+    required this.channelId,
+    required this.amountSat,
+    this.memo = '',
+    this.expirySeconds = 0,
+  });
+
+  Map<String, dynamic> toJson() => {
+        'channel_id': channelId,
+        'amount_sat': amountSat,
+        'memo': memo,
+        'expiry_seconds': expirySeconds,
+      };
+}
+
+/// Response to paying an invoice (payer side). Mirrors updateState's response
+/// shape plus the settled invoice.
+class PayInvoiceResp {
+  final bool accepted;
+  final String? rejectReason;
+  final String? peerSignatureHex;
+  final String? settlementSignatureHex;
+  final LnInvoice? invoice; // the paid invoice (on success)
+
+  const PayInvoiceResp({
+    required this.accepted,
+    this.rejectReason,
+    this.peerSignatureHex,
+    this.settlementSignatureHex,
+    this.invoice,
+  });
+
+  factory PayInvoiceResp.fromJson(Map<String, dynamic> json) => PayInvoiceResp(
+        accepted: json['accepted'] as bool? ?? false,
+        rejectReason: json['reject_reason'] as String?,
+        peerSignatureHex: json['peer_signature_hex'] as String?,
+        settlementSignatureHex: json['settlement_signature_hex'] as String?,
+        invoice: json['invoice'] is Map<String, dynamic>
+            ? LnInvoice.fromJson(json['invoice'] as Map<String, dynamic>)
+            : null,
+      );
+}
+
+/// Request to pay an invoice: the payer's channel plus its eLTOO state update
+/// (updateState's fields — the channel id moves into the body because the URL
+/// identifies the INVOICE here).
+class PayInvoiceReq {
+  final String channelId; // payer channel
+  final int stateIndex;
+  final int initiatorBalanceSat;
+  final int peerBalanceSat;
+  final String updateTxHex;
+  final String settlementTxHex;
+  final String ctvHash;
+
+  const PayInvoiceReq({
+    required this.channelId,
+    required this.stateIndex,
+    required this.initiatorBalanceSat,
+    required this.peerBalanceSat,
+    required this.updateTxHex,
+    required this.settlementTxHex,
+    required this.ctvHash,
+  });
+
+  Map<String, dynamic> toJson() => {
+        'channel_id': channelId,
+        'state_index': stateIndex,
+        'initiator_balance_sat': initiatorBalanceSat,
+        'peer_balance_sat': peerBalanceSat,
+        'update_tx_hex': updateTxHex,
+        'settlement_tx_hex': settlementTxHex,
+        'ctv_hash': ctvHash,
+      };
+}

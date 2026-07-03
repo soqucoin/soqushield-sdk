@@ -134,6 +134,23 @@ class LspClient {
   Future<CloseResp> closeChannel(String id) async =>
       CloseResp.fromJson(await _reqMap('POST', '/v1/channels/$id/close'));
 
+  // ─── Invoices (custodial rail — INVOICE_RAIL_SPEC.md) ───
+
+  /// POST /v1/invoices — create a pending invoice on a hosted channel (payee).
+  Future<LnInvoice> createInvoice(CreateInvoiceReq req) async =>
+      LnInvoice.fromJson(await _reqMap('POST', '/v1/invoices', req.toJson()));
+
+  /// GET /v1/invoices/{id} — invoice status (payer preview + payee polling).
+  Future<LnInvoice> getInvoice(String id) async =>
+      LnInvoice.fromJson(await _reqMap('GET', '/v1/invoices/$id'));
+
+  /// POST /v1/invoices/{id}/pay — settle an invoice with the payer's eLTOO
+  /// state update (updateState's fields + the payer channel_id; must move
+  /// exactly the invoice amount initiator→peer).
+  Future<PayInvoiceResp> payInvoice(String id, PayInvoiceReq req) async =>
+      PayInvoiceResp.fromJson(
+          await _reqMap('POST', '/v1/invoices/$id/pay', req.toJson()));
+
   // ─── Diagnostics ───
 
   Future<Map<String, dynamic>> dashboard() => _reqMap('GET', '/v1/dashboard');
