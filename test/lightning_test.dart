@@ -154,9 +154,8 @@ class FakeLsp {
       final ch = channels[chId];
       if (ch == null) return (status: 400, body: j({'error': 'channel $chId not found'}));
       if (amount <= 0) return (status: 400, body: j({'error': 'amount must be positive'}));
-      if ((ch['capacity_sat'] as int) + amount > maxChannelSat) {
-        return (status: 400, body: j({'error': 'channel full'}));
-      }
+      // NO capacity headroom check — credits are debit-backed and may grow
+      // capacity past the open cap (live bug 2026-07-03).
       final id = 'i' * 62 + (++_invSeq).toString().padLeft(2, '0'); // 64 chars
       final inv = {
         'invoice_id': id,
@@ -461,6 +460,22 @@ void main() {
       expect(payeeAfter.initiatorBalanceSat, 50000000 + 25000000);
       expect(payeeAfter.initiatorBalanceSat + payeeAfter.peerBalanceSat,
           payeeAfter.capacitySat);
+    });
+
+    test('a channel at the open cap can still receive — capacity grows past it', () async {
+      // Live bug 2026-07-03: the faucet/classic flow opens at max_channel_sat
+      // and the headroom check made such channels unable to receive at all.
+      final lsp = FakeLsp();
+      final sdk = ln(lsp);
+      final payee = await sdk.openChannel(_params); // 100M = the open cap
+      final payer = await sdk.openChannel(halfCap);
+
+      final inv = await sdk.createInvoice(payee.channelId, 10000000);
+      await sdk.payInvoice(inv.invoiceId, payer.channelId);
+
+      final after = await sdk.channel(payee.channelId);
+      expect(after.capacitySat, 110000000); // past maxChannelSat
+      expect(after.initiatorBalanceSat + after.peerBalanceSat, after.capacitySat);
     });
 
     test('paying a non-pending invoice throws before any network build', () async {
