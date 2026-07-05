@@ -299,6 +299,18 @@ class SoqLightning {
   /// Fetch an invoice's current status.
   Future<LnInvoice> invoice(String invoiceId) => client.getInvoice(invoiceId);
 
+  /// Ask the stagenet faucet to settle [invoiceId] — the guaranteed first
+  /// receive for a beta user with no counterparty yet. Hub-side limits apply
+  /// (invoice amount cap, per-IP and per-channel cooldowns); rejections
+  /// surface as [LspException] with the hub's reason.
+  Future<LnInvoice> faucetPayInvoice(String invoiceId) async {
+    final resp = await client.faucetPayInvoice(invoiceId);
+    if (!resp.accepted || resp.invoice == null) {
+      throw StateError(resp.rejectReason ?? 'faucet payment rejected');
+    }
+    return resp.invoice!;
+  }
+
   /// Pay an invoice from [channelId]: builds the eLTOO state update moving
   /// exactly the invoice amount initiator→peer (same construction as [pay])
   /// and settles it through the invoice endpoint, so the LSP atomically

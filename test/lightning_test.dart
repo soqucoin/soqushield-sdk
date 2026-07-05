@@ -95,6 +95,25 @@ class FakeLsp {
     if (method == 'GET' && path.endsWith('/v1/health')) {
       return (status: 200, body: j({'status': 'ok'}));
     }
+    // Faucet-over-Lightning — mirrors faucet/payinvoice.go: the hub settles a
+    // pending invoice from its own payer channel (capacity-growth credit).
+    if (method == 'POST' && path.endsWith('/v1/faucet/pay-invoice')) {
+      final id = body['invoice_id'] as String? ?? '';
+      final inv = invoices[id];
+      if (inv == null) return (status: 404, body: j({'error': 'invoice not found'}));
+      if (inv['status'] != 'pending') {
+        return (status: 409, body: j({'error': 'invoice ${inv['status']}'}));
+      }
+      final amount = inv['amount_sat'] as int;
+      final payee = channels[inv['channel_id']]!;
+      payee['capacity_sat'] = (payee['capacity_sat'] as int) + amount;
+      payee['initiator_balance_sat'] = (payee['initiator_balance_sat'] as int) + amount;
+      payee['state_index'] = (payee['state_index'] as int) + 1;
+      inv['status'] = 'paid';
+      inv['paid_at'] = '2026-07-02T00:30:00Z';
+      inv['payer_channel_id'] = 'faucet-payer';
+      return (status: 200, body: j({'accepted': true, 'invoice': inv}));
+    }
     if (method == 'POST' && path.endsWith('/v1/faucet')) {
       final amount = (body['amount_sat'] as num).toInt();
       if (faucetSilentDecline && amount > faucetHonorSat) {
@@ -476,6 +495,25 @@ void main() {
       final after = await sdk.channel(payee.channelId);
       expect(after.capacitySat, 110000000); // past maxChannelSat
       expect(after.initiatorBalanceSat + after.peerBalanceSat, after.capacitySat);
+    });
+
+    test('faucetPayInvoice settles a pending invoice without a payer channel', () async {
+      final lsp = FakeLsp();
+      final sdk = ln(lsp);
+      final payee = await sdk.openChannel(halfCap);
+
+      final inv = await sdk.createInvoice(payee.channelId, 1000000, memo: 'first receive');
+      final paid = await sdk.faucetPayInvoice(inv.invoiceId);
+      expect(paid.isPaid, isTrue);
+      expect(paid.payerChannelId, 'faucet-payer');
+
+      // The credit is the normal capacity growth.
+      final after = await sdk.channel(payee.channelId);
+      expect(after.capacitySat, 50000000 + 1000000);
+      expect(after.initiatorBalanceSat + after.peerBalanceSat, after.capacitySat);
+
+      // A second faucet payment of the SAME invoice is terminal → throws.
+      await expectLater(sdk.faucetPayInvoice(inv.invoiceId), throwsA(anything));
     });
 
     test('paying a non-pending invoice throws before any network build', () async {

@@ -101,6 +101,13 @@ class LspClient {
   Future<FaucetResp> faucetDrip(FaucetReq req) async =>
       FaucetResp.fromJson(await _reqMap('POST', '/v1/faucet', req.toJson()));
 
+  /// POST /v1/faucet/pay-invoice — the stagenet faucet settles a pending
+  /// invoice (the guaranteed first receive for beta users; hub-side rate
+  /// limits: per IP and per payee channel). Non-2xx rejections throw.
+  Future<PayInvoiceResp> faucetPayInvoice(String invoiceId) async =>
+      PayInvoiceResp.fromJson(await _reqMap(
+          'POST', '/v1/faucet/pay-invoice', {'invoice_id': invoiceId}));
+
   // ─── Channels ───
 
   Future<OpenChannelResp> openChannel(OpenChannelReq req) async =>
