@@ -90,6 +90,38 @@ class OpenChannelParams {
   });
 }
 
+/// Parameters for a self-custodial (user-funded) channel open — the inputs the SDK needs to
+/// build + co-sign the state-0 (Tu, Ts) against a 2-of-2 the user controls. The funding tx itself
+/// is built + broadcast by the CALLER (the wallet's L1 tx builder), not the SDK; see
+/// [SoqLightning.selfFundedOpen] for the required ordering.
+class SelfFundedOpenParams {
+  final String fundingTxid; // DISPLAY-order txid of the unbroadcast funding tx
+  final int fundingVout; // the 2-of-2 output index in that funding tx
+  final int capacitySat; // MUST equal the funding output value
+  final String userPubKeyHex; // initiator ML-DSA-44 pub (2624 hex chars)
+  final String lspPubKeyHex; // the LSP peer pub used to build the 2-of-2 (from info()['pub_key_hex'])
+  final String initiatorAddress; // L1 settlement payout address (cooperative close)
+  final Uint8List initiatorScriptPubKey; // the user's settlement payout scriptPubKey
+  final Uint8List userSecretKey; // ML-DSA-44 secret key (on-device)
+  final MlDsaSign sign; // ML-DSA-44 signer
+  final int csvDelay; // settlement CSV tier the LSP accepts (e.g. 144 or 288)
+  final BigInt feeSat; // fixed per-tx on-chain fee (v1, spec §H)
+
+  const SelfFundedOpenParams({
+    required this.fundingTxid,
+    required this.fundingVout,
+    required this.capacitySat,
+    required this.userPubKeyHex,
+    required this.lspPubKeyHex,
+    required this.initiatorAddress,
+    required this.initiatorScriptPubKey,
+    required this.userSecretKey,
+    required this.sign,
+    required this.csvDelay,
+    required this.feeSat,
+  });
+}
+
 class SoqLightning {
   final LspClient client;
   final UpdateTxBuilder _builder;
@@ -227,6 +259,125 @@ class SoqLightning {
     return after;
   }
 
+  // ─── Invoice rail (custodial receive — INVOICE_RAIL_SPEC.md) ───
+
+  /// Parse a `soqln:` invoice URI to its invoice id, or null if malformed.
+  /// Accepts the v1 bare form `soqln:<64-hex-id>` and the forward-compatible
+  /// `soqln:<host>/<64-hex-id>` (host ignored — single-LSP v1).
+  static String? parseInvoiceUri(String input) {
+    var s = input.trim();
+    if (!s.toLowerCase().startsWith('soqln:')) return null;
+    s = s.substring(6);
+    final slash = s.lastIndexOf('/');
+    if (slash >= 0) s = s.substring(slash + 1);
+    s = s.toLowerCase();
+    if (s.length != 64) return null;
+    for (final c in s.codeUnits) {
+      final hexDigit = (c >= 0x30 && c <= 0x39) || (c >= 0x61 && c <= 0x66);
+      if (!hexDigit) return null;
+    }
+    return s;
+  }
+
+  /// Create a pending invoice for [amountSat] on the payee's hosted [channelId].
+  /// Share the returned [LnInvoice.uri] (QR/copy) with the payer.
+  Future<LnInvoice> createInvoice(
+    String channelId,
+    int amountSat, {
+    String memo = '',
+    int expirySeconds = 0,
+  }) async {
+    if (amountSat <= 0) throw ArgumentError('amount must be positive');
+    return client.createInvoice(CreateInvoiceReq(
+      channelId: channelId,
+      amountSat: amountSat,
+      memo: memo,
+      expirySeconds: expirySeconds,
+    ));
+  }
+
+  /// Fetch an invoice's current status.
+  Future<LnInvoice> invoice(String invoiceId) => client.getInvoice(invoiceId);
+
+  /// Ask the stagenet faucet to settle [invoiceId] — the guaranteed first
+  /// receive for a beta user with no counterparty yet. Hub-side limits apply
+  /// (invoice amount cap, per-IP and per-channel cooldowns); rejections
+  /// surface as [LspException] with the hub's reason.
+  Future<LnInvoice> faucetPayInvoice(String invoiceId) async {
+    final resp = await client.faucetPayInvoice(invoiceId);
+    if (!resp.accepted || resp.invoice == null) {
+      throw StateError(resp.rejectReason ?? 'faucet payment rejected');
+    }
+    return resp.invoice!;
+  }
+
+  /// Pay an invoice from [channelId]: builds the eLTOO state update moving
+  /// exactly the invoice amount initiator→peer (same construction as [pay])
+  /// and settles it through the invoice endpoint, so the LSP atomically
+  /// credits the payee. Returns the updated payer channel and the paid invoice.
+  Future<({LnChannel channel, LnInvoice invoice})> payInvoice(
+    String invoiceId,
+    String channelId,
+  ) async {
+    final inv = await client.getInvoice(invoiceId);
+    if (!inv.isPending) throw StateError('invoice is ${inv.status}');
+
+    final ch = await client.getChannel(channelId);
+    if (ch.state != 'open') throw StateError('channel not open (state=${ch.state})');
+    if (inv.amountSat > ch.initiatorBalanceSat) {
+      throw StateError('insufficient initiator balance');
+    }
+
+    final next = UpdateContext(
+      channel: ch,
+      nextStateIndex: ch.stateIndex + 1,
+      nextInitiatorBalanceSat: ch.initiatorBalanceSat - inv.amountSat,
+      nextPeerBalanceSat: ch.peerBalanceSat + inv.amountSat,
+    );
+    final tx = await _builder.build(next);
+    final resp = await client.payInvoice(
+      invoiceId,
+      PayInvoiceReq(
+        channelId: channelId,
+        stateIndex: next.nextStateIndex,
+        initiatorBalanceSat: next.nextInitiatorBalanceSat,
+        peerBalanceSat: next.nextPeerBalanceSat,
+        updateTxHex: tx.updateTxHex,
+        settlementTxHex: tx.settlementTxHex,
+        ctvHash: tx.ctvHash,
+      ),
+    );
+    if (!resp.accepted) {
+      throw StateError('invoice pay rejected: ${resp.rejectReason ?? "unknown"}');
+    }
+
+    final after = await client.getChannel(channelId);
+    if (after.stateIndex <= ch.stateIndex) {
+      throw StateError('state did not advance: ${ch.stateIndex} -> ${after.stateIndex}');
+    }
+    if (after.initiatorBalanceSat + after.peerBalanceSat != after.capacitySat) {
+      throw StateError('balance not conserved after invoice pay');
+    }
+    return (channel: after, invoice: resp.invoice ?? inv);
+  }
+
+  /// Poll an invoice until it leaves `pending` (paid or expired) or [timeout]
+  /// elapses. Returns the terminal invoice; on timeout returns the last-seen
+  /// (still pending) invoice — check [LnInvoice.isPaid].
+  Future<LnInvoice> awaitInvoicePaid(
+    String invoiceId, {
+    Duration interval = const Duration(seconds: 2),
+    Duration timeout = const Duration(minutes: 10),
+  }) async {
+    final deadline = DateTime.now().add(timeout);
+    var inv = await client.getInvoice(invoiceId);
+    while (inv.isPending && DateTime.now().isBefore(deadline)) {
+      await Future<void>.delayed(interval);
+      inv = await client.getInvoice(invoiceId);
+    }
+    return inv;
+  }
+
   /// Self-custodial pay — one F1-complete LSP round (spec §D + §E). Moves [amountSat] to the peer
   /// and returns the fully-signed (Tu, Ts) the caller MUST persist: with them the user can
   /// unilaterally close WITHOUT the LSP. Unlike [pay] (the demo/opaque path) this does real
@@ -237,9 +388,11 @@ class SoqLightning {
   /// settlement). ⚠️ v1 policy (§H — FLAG): the INITIATOR pays both on-chain force-close fees (the
   /// LN default), so its settlement output = logical balance − 2·fee. Revisit when fee policy lands.
   ///
-  /// ⚠️ TRUST GAP (WS2b Task 7): the LSP co-signs the settlement WITHOUT validating its outputs
-  /// match the recorded balances — a malicious spoke could over-pay itself. Safe only until the
-  /// LSP enforces settlement-output validation.
+  /// Trust model (Task 7, bead m91 — CLOSED): two independent guards now bound over-pay. (1) The
+  /// user builds Ts LOCALLY here (settlement output = own balance − 2·fee), so the LSP only returns
+  /// a co-sign PARTIAL over the user-chosen sighash — it cannot redirect outputs. (2) The LSP
+  /// independently REJECTS any settlement whose outputs exceed the recorded balances or capacity
+  /// (manager.go validateAndApplyUpdate), so a malicious spoke cannot over-pay itself either.
   Future<({LnChannel channel, SignedTx update, SignedTx settlement})> selfCustodialPay(
       String channelId, int amountSat, SelfCustodyContext ctx) async {
     if (amountSat <= 0) throw ArgumentError('amount must be positive');
@@ -301,6 +454,60 @@ class SoqLightning {
     final after = await client.getChannel(channelId);
     return (channel: after, update: round.update, settlement: round.settlement);
   }
+
+  /// Gate 2 — open a SELF-CUSTODIAL channel funded by a 2-of-2 the user controls (spec §3.2).
+  /// Returns the channel id + the fully-signed state-0 (Tu, Ts) the caller MUST persist: with them
+  /// the user can unilaterally exit (force-close) WITHOUT the LSP — the property [openChannel]/
+  /// [fundAndOpen] (LSP-hosted) do NOT give. Combine with [selfCustodialPay] for subsequent states.
+  ///
+  /// The funding tx is the CALLER's responsibility (the wallet's L1 builder), and the ORDER is
+  /// load-bearing:
+  ///   1. Build (do NOT broadcast) a funding tx paying [SelfFundedOpenParams.capacitySat] to the
+  ///      witness-v6 2-of-2 of (userPub, lspPub) at vout [SelfFundedOpenParams.fundingVout]. The
+  ///      2-of-2 scriptPubKey is `p2wshV6(keyhashFunding2of2(userPub, lspPub).witnessScript)`.
+  ///   2. Call this — it validates, co-signs, and (via the returned [SelfFundedOpenResult]) lets
+  ///      you verify the LSP funds the SAME 2-of-2 you built (mismatch ⇒ it throws, so you never
+  ///      broadcast into an unspendable output).
+  ///   3. ONLY on success, broadcast the funding tx.
+  ///   4. Poll [confirmFunding] until [ConfirmFundingResp.isOpen].
+  /// Broadcasting before step 2 succeeds is a FUND-LOSS TRAP. [lspPubKeyHex] MUST be the same key
+  /// used to build the funding 2-of-2 (fetch once via `info()['pub_key_hex']`).
+  Future<SelfFundedOpenResult> selfFundedOpen(SelfFundedOpenParams p) async {
+    final userPub = fromHex(p.userPubKeyHex);
+    final lspPub = fromHex(p.lspPubKeyHex);
+    final bc = EltooBroadcaster(ChannelParams(
+      funding: OutPoint.fromTxidHex(p.fundingTxid, p.fundingVout),
+      capacitySat: BigInt.from(p.capacitySat),
+      initiatorPub: userPub,
+      peerPub: lspPub,
+      initiatorScriptPubKey: p.initiatorScriptPubKey,
+      // Unused at state 0: the full-refund settlement has a single output to the initiator, and the
+      // LSP's settlement payout isn't known until later states. Real peer payouts arrive via pay().
+      peerScriptPubKey: Uint8List(0),
+      settlementCsv: p.csvDelay,
+      feeSat: p.feeSat,
+    ));
+
+    return selfFundedOpenRound(
+      bc,
+      (req) => client.selfFundedOpen(req),
+      fundingTxidDisplay: p.fundingTxid,
+      fundingVout: p.fundingVout,
+      csvDelay: p.csvDelay,
+      initiatorPubKeyHex: p.userPubKeyHex,
+      initiatorAddress: p.initiatorAddress,
+      userSecretKey: p.userSecretKey,
+      userPub: userPub,
+      lspPub: lspPub,
+      mldsa: p.sign,
+    );
+  }
+
+  /// Confirm a self-funded channel on-chain after the funding tx is broadcast (step 4 above). One
+  /// poll: returns the current confirmations and whether the LSP has promoted the channel to OPEN.
+  /// The caller drives the poll cadence (re-call until [ConfirmFundingResp.isOpen]).
+  Future<ConfirmFundingResp> confirmFunding(String channelId, String fundingTxid) =>
+      client.confirmFunding(channelId, ConfirmFundingReq(fundingTxid: fundingTxid));
 
   /// Cooperative close → L1 settlement enqueued via the LSP.
   ///

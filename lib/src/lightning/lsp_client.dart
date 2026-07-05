@@ -101,6 +101,13 @@ class LspClient {
   Future<FaucetResp> faucetDrip(FaucetReq req) async =>
       FaucetResp.fromJson(await _reqMap('POST', '/v1/faucet', req.toJson()));
 
+  /// POST /v1/faucet/pay-invoice — the stagenet faucet settles a pending
+  /// invoice (the guaranteed first receive for beta users; hub-side rate
+  /// limits: per IP and per payee channel). Non-2xx rejections throw.
+  Future<PayInvoiceResp> faucetPayInvoice(String invoiceId) async =>
+      PayInvoiceResp.fromJson(await _reqMap(
+          'POST', '/v1/faucet/pay-invoice', {'invoice_id': invoiceId}));
+
   // ─── Channels ───
 
   Future<OpenChannelResp> openChannel(OpenChannelReq req) async =>
@@ -119,8 +126,37 @@ class LspClient {
       UpdateStateResp.fromJson(
           await _reqMap('POST', '/v1/channels/$id/update', req.toJson()));
 
+  /// POST /v1/channels/self-funded — open a channel against a user-provided 2-of-2 funding
+  /// outpoint (the self-custodial path). The LSP validates the state-0 txs and co-signs both.
+  Future<SelfFundedOpenResp> selfFundedOpen(SelfFundedOpenReq req) async =>
+      SelfFundedOpenResp.fromJson(
+          await _reqMap('POST', '/v1/channels/self-funded', req.toJson()));
+
+  /// POST /v1/channels/{id}/funded — confirm a self-funded channel on-chain (call after the
+  /// funding tx is broadcast; poll until [ConfirmFundingResp.isOpen]).
+  Future<ConfirmFundingResp> confirmFunding(String id, ConfirmFundingReq req) async =>
+      ConfirmFundingResp.fromJson(
+          await _reqMap('POST', '/v1/channels/$id/funded', req.toJson()));
+
   Future<CloseResp> closeChannel(String id) async =>
       CloseResp.fromJson(await _reqMap('POST', '/v1/channels/$id/close'));
+
+  // ─── Invoices (custodial rail — INVOICE_RAIL_SPEC.md) ───
+
+  /// POST /v1/invoices — create a pending invoice on a hosted channel (payee).
+  Future<LnInvoice> createInvoice(CreateInvoiceReq req) async =>
+      LnInvoice.fromJson(await _reqMap('POST', '/v1/invoices', req.toJson()));
+
+  /// GET /v1/invoices/{id} — invoice status (payer preview + payee polling).
+  Future<LnInvoice> getInvoice(String id) async =>
+      LnInvoice.fromJson(await _reqMap('GET', '/v1/invoices/$id'));
+
+  /// POST /v1/invoices/{id}/pay — settle an invoice with the payer's eLTOO
+  /// state update (updateState's fields + the payer channel_id; must move
+  /// exactly the invoice amount initiator→peer).
+  Future<PayInvoiceResp> payInvoice(String id, PayInvoiceReq req) async =>
+      PayInvoiceResp.fromJson(
+          await _reqMap('POST', '/v1/invoices/$id/pay', req.toJson()));
 
   // ─── Diagnostics ───
 

@@ -44,7 +44,9 @@ class FakeLsp {
   bool closeDropsResponse;
 
   final Map<String, Map<String, dynamic>> channels = {};
+  final Map<String, Map<String, dynamic>> invoices = {};
   int _seq = 0;
+  int _invSeq = 0;
 
   /// The most recent update request body seen (for asserting the placeholder TX seam).
   Map<String, dynamic>? lastUpdate;
@@ -92,6 +94,25 @@ class FakeLsp {
     }
     if (method == 'GET' && path.endsWith('/v1/health')) {
       return (status: 200, body: j({'status': 'ok'}));
+    }
+    // Faucet-over-Lightning — mirrors faucet/payinvoice.go: the hub settles a
+    // pending invoice from its own payer channel (capacity-growth credit).
+    if (method == 'POST' && path.endsWith('/v1/faucet/pay-invoice')) {
+      final id = body['invoice_id'] as String? ?? '';
+      final inv = invoices[id];
+      if (inv == null) return (status: 404, body: j({'error': 'invoice not found'}));
+      if (inv['status'] != 'pending') {
+        return (status: 409, body: j({'error': 'invoice ${inv['status']}'}));
+      }
+      final amount = inv['amount_sat'] as int;
+      final payee = channels[inv['channel_id']]!;
+      payee['capacity_sat'] = (payee['capacity_sat'] as int) + amount;
+      payee['initiator_balance_sat'] = (payee['initiator_balance_sat'] as int) + amount;
+      payee['state_index'] = (payee['state_index'] as int) + 1;
+      inv['status'] = 'paid';
+      inv['paid_at'] = '2026-07-02T00:30:00Z';
+      inv['payer_channel_id'] = 'faucet-payer';
+      return (status: 200, body: j({'accepted': true, 'invoice': inv}));
     }
     if (method == 'POST' && path.endsWith('/v1/faucet')) {
       final amount = (body['amount_sat'] as num).toInt();
@@ -142,6 +163,77 @@ class FakeLsp {
           throw DioException(requestOptions: o, type: DioExceptionType.connectionError);
         }
         return (status: 200, body: j({'accepted': true, 'settlement_txid': 'tx_settle'}));
+      }
+    }
+
+    // Invoice rail — mirrors rest_invoice.go semantics (hub-hop, capacity growth).
+    if (method == 'POST' && path.endsWith('/v1/invoices')) {
+      final chId = body['channel_id'] as String? ?? '';
+      final amount = (body['amount_sat'] as num?)?.toInt() ?? 0;
+      final ch = channels[chId];
+      if (ch == null) return (status: 400, body: j({'error': 'channel $chId not found'}));
+      if (amount <= 0) return (status: 400, body: j({'error': 'amount must be positive'}));
+      // NO capacity headroom check — credits are debit-backed and may grow
+      // capacity past the open cap (live bug 2026-07-03).
+      final id = 'i' * 62 + (++_invSeq).toString().padLeft(2, '0'); // 64 chars
+      final inv = {
+        'invoice_id': id,
+        'uri': 'soqln:$id',
+        'channel_id': chId,
+        'amount_sat': amount,
+        'memo': body['memo'] ?? '',
+        'status': 'pending',
+        'created_at': '2026-07-02T00:00:00Z',
+        'expires_at': '2026-07-02T01:00:00Z',
+      };
+      invoices[id] = inv;
+      return (status: 200, body: j(inv));
+    }
+    final invIdx = path.split('/').where((s) => s.isNotEmpty).toList().indexOf('invoices');
+    if (invIdx >= 0) {
+      final isegs = path.split('/').where((s) => s.isNotEmpty).toList();
+      if (isegs.length > invIdx + 1) {
+        final id = isegs[invIdx + 1];
+        final inv = invoices[id];
+        if (inv == null) return (status: 404, body: j({'error': 'invoice not found'}));
+        final action = isegs.length > invIdx + 2 ? isegs[invIdx + 2] : null;
+        if (method == 'GET' && action == null) {
+          return (status: 200, body: j(inv));
+        }
+        if (method == 'POST' && action == 'pay') {
+          if (inv['status'] != 'pending') {
+            return (status: 200, body: j({'accepted': false, 'reject_reason': 'invoice already ${inv['status']}'}));
+          }
+          final payerId = body['channel_id'] as String? ?? '';
+          final payer = channels[payerId];
+          if (payer == null) {
+            return (status: 200, body: j({'accepted': false, 'reject_reason': 'payer channel not found'}));
+          }
+          if (payerId == inv['channel_id']) {
+            return (status: 200, body: j({'accepted': false, 'reject_reason': 'cannot pay an invoice from its own channel'}));
+          }
+          final amount = inv['amount_sat'] as int;
+          final newInit = (body['initiator_balance_sat'] as num).toInt();
+          final newPeer = (body['peer_balance_sat'] as num).toInt();
+          if (newPeer - (payer['peer_balance_sat'] as int) != amount ||
+              newInit != (payer['initiator_balance_sat'] as int) - amount) {
+            return (status: 200, body: j({'accepted': false, 'reject_reason': 'payment must move exactly the invoice amount'}));
+          }
+          payer['state_index'] = (body['state_index'] as num).toInt();
+          payer['initiator_balance_sat'] = newInit;
+          payer['peer_balance_sat'] = newPeer;
+          final payee = channels[inv['channel_id']]!;
+          payee['capacity_sat'] = (payee['capacity_sat'] as int) + amount;
+          payee['initiator_balance_sat'] = (payee['initiator_balance_sat'] as int) + amount;
+          payee['state_index'] = (payee['state_index'] as int) + 1;
+          inv['status'] = 'paid';
+          inv['paid_at'] = '2026-07-02T00:30:00Z';
+          inv['payer_channel_id'] = payerId;
+          return (
+            status: 200,
+            body: j({'accepted': true, 'payee_credited': true, 'peer_signature_hex': 'sig', 'invoice': inv})
+          );
+        }
       }
     }
 
@@ -357,6 +449,133 @@ void main() {
       await sdk.pay(ch.channelId, 10000000);
       expect(lsp.lastUpdate!['update_tx_hex'], '0xUPDATE');
       expect(lsp.lastUpdate!['ctv_hash'], '0xCTV');
+    });
+  });
+
+  group('invoice rail (custodial receive)', () {
+    // Half the LSP cap, like the app's Connect flow — leaves receive headroom
+    // (an invoice credit grows capacity, bounded by max_channel_sat).
+    const halfCap = OpenChannelParams(
+        pubKeyHex: 'aaaaaaaa', address: 'soq1qtest', capacitySat: 50000000);
+    test('create → pay → payee credited via capacity growth', () async {
+      final lsp = FakeLsp();
+      final sdk = ln(lsp);
+      final payee = await sdk.openChannel(halfCap);
+      final payer = await sdk.openChannel(halfCap);
+
+      final inv = await sdk.createInvoice(payee.channelId, 25000000, memo: 'coffee');
+      expect(inv.isPending, isTrue);
+      expect(inv.uri, startsWith('soqln:'));
+      expect(inv.amountSat, 25000000);
+
+      final result = await sdk.payInvoice(inv.invoiceId, payer.channelId);
+      expect(result.invoice.isPaid, isTrue);
+      expect(result.invoice.payerChannelId, payer.channelId);
+      // Payer debited.
+      expect(result.channel.initiatorBalanceSat, 50000000 - 25000000);
+      // Payee credited: capacity + balance grew together, conservation holds.
+      final payeeAfter = await sdk.channel(payee.channelId);
+      expect(payeeAfter.capacitySat, 50000000 + 25000000);
+      expect(payeeAfter.initiatorBalanceSat, 50000000 + 25000000);
+      expect(payeeAfter.initiatorBalanceSat + payeeAfter.peerBalanceSat,
+          payeeAfter.capacitySat);
+    });
+
+    test('a channel at the open cap can still receive — capacity grows past it', () async {
+      // Live bug 2026-07-03: the faucet/classic flow opens at max_channel_sat
+      // and the headroom check made such channels unable to receive at all.
+      final lsp = FakeLsp();
+      final sdk = ln(lsp);
+      final payee = await sdk.openChannel(_params); // 100M = the open cap
+      final payer = await sdk.openChannel(halfCap);
+
+      final inv = await sdk.createInvoice(payee.channelId, 10000000);
+      await sdk.payInvoice(inv.invoiceId, payer.channelId);
+
+      final after = await sdk.channel(payee.channelId);
+      expect(after.capacitySat, 110000000); // past maxChannelSat
+      expect(after.initiatorBalanceSat + after.peerBalanceSat, after.capacitySat);
+    });
+
+    test('faucetPayInvoice settles a pending invoice without a payer channel', () async {
+      final lsp = FakeLsp();
+      final sdk = ln(lsp);
+      final payee = await sdk.openChannel(halfCap);
+
+      final inv = await sdk.createInvoice(payee.channelId, 1000000, memo: 'first receive');
+      final paid = await sdk.faucetPayInvoice(inv.invoiceId);
+      expect(paid.isPaid, isTrue);
+      expect(paid.payerChannelId, 'faucet-payer');
+
+      // The credit is the normal capacity growth.
+      final after = await sdk.channel(payee.channelId);
+      expect(after.capacitySat, 50000000 + 1000000);
+      expect(after.initiatorBalanceSat + after.peerBalanceSat, after.capacitySat);
+
+      // A second faucet payment of the SAME invoice is terminal → throws.
+      await expectLater(sdk.faucetPayInvoice(inv.invoiceId), throwsA(anything));
+    });
+
+    test('paying a non-pending invoice throws before any network build', () async {
+      final lsp = FakeLsp();
+      final sdk = ln(lsp);
+      final payee = await sdk.openChannel(halfCap);
+      final payer = await sdk.openChannel(halfCap);
+      final inv = await sdk.createInvoice(payee.channelId, 1000);
+      await sdk.payInvoice(inv.invoiceId, payer.channelId);
+
+      // Second pay: the facade sees status=paid and refuses locally.
+      expect(
+        () => sdk.payInvoice(inv.invoiceId, payer.channelId),
+        throwsA(isA<StateError>()),
+      );
+    });
+
+    test('insufficient payer balance throws', () async {
+      final lsp = FakeLsp();
+      final sdk = ln(lsp);
+      final payee = await sdk.openChannel(halfCap);
+      final payer = await sdk.openChannel(halfCap);
+      final inv = await sdk.createInvoice(payee.channelId, 30000000);
+      // Drain the payer below the invoice amount first.
+      await sdk.pay(payer.channelId, 40000000);
+      expect(
+        () => sdk.payInvoice(inv.invoiceId, payer.channelId),
+        throwsA(isA<StateError>()),
+      );
+    });
+
+    test('awaitInvoicePaid returns once the invoice settles', () async {
+      final lsp = FakeLsp();
+      final sdk = ln(lsp);
+      final payee = await sdk.openChannel(halfCap);
+      final payer = await sdk.openChannel(halfCap);
+      final inv = await sdk.createInvoice(payee.channelId, 1000);
+
+      final waiter = sdk.awaitInvoicePaid(inv.invoiceId,
+          interval: const Duration(milliseconds: 10));
+      await sdk.payInvoice(inv.invoiceId, payer.channelId);
+      final settled = await waiter;
+      expect(settled.isPaid, isTrue);
+    });
+
+    test('parseInvoiceUri accepts v1 and host-prefixed forms, rejects junk', () {
+      final id = 'ab' * 32;
+      expect(SoqLightning.parseInvoiceUri('soqln:$id'), id);
+      expect(SoqLightning.parseInvoiceUri(' SOQLN:$id '), id);
+      expect(SoqLightning.parseInvoiceUri('soqln:lsp.soqu.org/$id'), id);
+      expect(SoqLightning.parseInvoiceUri('soqln:${'ab' * 31}'), isNull); // short
+      expect(SoqLightning.parseInvoiceUri('soqln:${'zz' * 32}'), isNull); // non-hex
+      expect(SoqLightning.parseInvoiceUri(id), isNull); // no scheme
+      expect(SoqLightning.parseInvoiceUri('lightning:$id'), isNull);
+    });
+
+    test('createInvoice validates amount locally', () async {
+      final lsp = FakeLsp();
+      final sdk = ln(lsp);
+      final payee = await sdk.openChannel(halfCap);
+      expect(() => sdk.createInvoice(payee.channelId, 0), throwsArgumentError);
+      expect(() => sdk.createInvoice(payee.channelId, -5), throwsArgumentError);
     });
   });
 }

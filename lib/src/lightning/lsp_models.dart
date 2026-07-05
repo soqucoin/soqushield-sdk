@@ -101,6 +101,128 @@ class OpenChannelResp {
       );
 }
 
+/// Request: open a channel against a USER-PROVIDED 2-of-2 funding outpoint (the self-custodial
+/// path — rest.go POST /v1/channels/self-funded, bead pw2). The user builds (but does NOT yet
+/// broadcast) a funding tx paying [capacitySat] to the witness-v6 2-of-2, then sends the state-0
+/// update + full-refund settlement here for the LSP to validate + co-sign BEFORE the funding hits
+/// the chain (broadcasting first = a FUND-LOSS TRAP — funds locked in a 2-of-2 the LSP won't sign).
+///
+/// Field names mirror selfFundedOpenReq (rest.go:562-572) verbatim over the wire.
+class SelfFundedOpenReq {
+  final String initiatorPubKeyHex; // 1312-byte ML-DSA-44 pub (2624 hex chars)
+  final int capacitySat; // MUST equal the on-chain funding output value (confirm rule 9)
+  final int csvDelay; // 144 or 288 (the only tiers the LSP accepts for self-funded opens)
+  final String initiatorAddress; // L1 settlement payout (cooperative close)
+  final String fundingTxid; // DISPLAY-order txid (64 hex) of the unbroadcast funding tx
+  final int fundingVout; // the 2-of-2 output index in that funding tx
+  final String updateTxHex; // state-0 update (locktime 1; spends fundingTxid:fundingVout)
+  final String settlementTxHex; // state-0 full-refund settlement (single output to initiator)
+  final String ctvHash;
+
+  const SelfFundedOpenReq({
+    required this.initiatorPubKeyHex,
+    required this.capacitySat,
+    required this.csvDelay,
+    required this.initiatorAddress,
+    required this.fundingTxid,
+    required this.fundingVout,
+    required this.updateTxHex,
+    required this.settlementTxHex,
+    required this.ctvHash,
+  });
+
+  Map<String, dynamic> toJson() => {
+        'initiator_pub_key_hex': initiatorPubKeyHex,
+        'capacity_sat': capacitySat,
+        'csv_delay': csvDelay,
+        'initiator_address': initiatorAddress,
+        'funding_txid': fundingTxid,
+        'funding_vout': fundingVout,
+        'update_tx_hex': updateTxHex,
+        'settlement_tx_hex': settlementTxHex,
+        'ctv_hash': ctvHash,
+      };
+}
+
+/// Response to a self-funded open (rest.go:630-639). On accept, [peerSignatureHex] is the LSP's
+/// 2421-byte partial over the state-0 UPDATE and [settlementSignatureHex] over the state-0
+/// SETTLEMENT — combined with the user's partials they yield the fully-signed (Tu, Ts) that let
+/// the user unilaterally exit WITHOUT the LSP. [fundingScriptPubKeyHex] is the LSP's recomputed
+/// 2-of-2 scriptPubKey — the user MUST verify their funding output pays exactly this before
+/// broadcasting (a mismatch means the LSP holds a different peer key → unspendable funds).
+class SelfFundedOpenResp {
+  final bool accepted;
+  final String? rejectReason;
+  final String? channelId;
+  final String? peerPubKeyHex;
+  final String? peerAddress;
+  final String? peerSignatureHex; // LSP partial on the UPDATE
+  final String? settlementSignatureHex; // LSP partial on the SETTLEMENT (self-custody exit)
+  final String? fundingScriptPubKeyHex;
+  final String? state; // "pending_funding" on accept
+
+  const SelfFundedOpenResp({
+    required this.accepted,
+    this.rejectReason,
+    this.channelId,
+    this.peerPubKeyHex,
+    this.peerAddress,
+    this.peerSignatureHex,
+    this.settlementSignatureHex,
+    this.fundingScriptPubKeyHex,
+    this.state,
+  });
+
+  factory SelfFundedOpenResp.fromJson(Map<String, dynamic> json) => SelfFundedOpenResp(
+        accepted: json['accepted'] as bool? ?? false,
+        rejectReason: json['reject_reason'] as String?,
+        channelId: json['channel_id'] as String?,
+        peerPubKeyHex: json['peer_pub_key_hex'] as String?,
+        peerAddress: json['peer_address'] as String?,
+        peerSignatureHex: json['peer_signature_hex'] as String?,
+        settlementSignatureHex: json['settlement_signature_hex'] as String?,
+        fundingScriptPubKeyHex: json['funding_script_pub_key_hex'] as String?,
+        state: json['state'] as String?,
+      );
+}
+
+/// Request: confirm a self-funded channel on-chain (rest.go POST /v1/channels/{id}/funded). Sent
+/// AFTER the funding tx is broadcast; the LSP checks the outpoint exists, pays the right value to
+/// the recomputed 2-of-2, and has [requiredConfirmations] confs before promoting to OPEN.
+class ConfirmFundingReq {
+  final String fundingTxid; // DISPLAY-order txid (must match the channel's recorded funding)
+
+  const ConfirmFundingReq({required this.fundingTxid});
+
+  Map<String, dynamic> toJson() => {'funding_txid': fundingTxid};
+}
+
+/// Response to a funding confirmation (rest.go confirmFunding). [state] is "open" once promoted,
+/// else "pending_funding" while [confirmations] < [required]. [error] carries a soft reason the
+/// poll should keep retrying on (e.g. "funding output not found on-chain" before propagation).
+class ConfirmFundingResp {
+  final String state;
+  final int confirmations;
+  final int required;
+  final String? error;
+
+  const ConfirmFundingResp({
+    required this.state,
+    required this.confirmations,
+    required this.required,
+    this.error,
+  });
+
+  bool get isOpen => state == 'open';
+
+  factory ConfirmFundingResp.fromJson(Map<String, dynamic> json) => ConfirmFundingResp(
+        state: json['state'] as String? ?? 'unknown',
+        confirmations: (json['confirmations'] as num?)?.toInt() ?? 0,
+        required: (json['required'] as num?)?.toInt() ?? 0,
+        error: json['error'] as String?,
+      );
+}
+
 /// Request: drip stagenet SOQ and (default) auto-open a channel (faucet.go:78-96).
 class FaucetReq {
   final String address;
@@ -327,4 +449,134 @@ class TowerProxyStatus {
             .map((t) => TowerProxyEntry.fromJson(t as Map<String, dynamic>))
             .toList(),
       );
+}
+
+// ─── Invoice rail (INVOICE_RAIL_SPEC.md) ───
+
+/// A payee's request for a fixed amount on a hosted channel, settled custodially
+/// by the LSP hub (payer channel debited, payee channel credited, atomically).
+class LnInvoice {
+  final String invoiceId;
+  final String uri; // soqln:<invoice_id>
+  final String channelId; // payee channel
+  final int amountSat;
+  final String memo;
+  final String status; // pending | paid | expired
+  final String createdAt; // RFC3339
+  final String expiresAt; // RFC3339
+  final String? paidAt; // RFC3339, set when paid
+  final String? payerChannelId; // set when paid
+
+  const LnInvoice({
+    required this.invoiceId,
+    required this.uri,
+    required this.channelId,
+    required this.amountSat,
+    required this.memo,
+    required this.status,
+    required this.createdAt,
+    required this.expiresAt,
+    this.paidAt,
+    this.payerChannelId,
+  });
+
+  bool get isPending => status == 'pending';
+  bool get isPaid => status == 'paid';
+  bool get isExpired => status == 'expired';
+
+  factory LnInvoice.fromJson(Map<String, dynamic> json) => LnInvoice(
+        invoiceId: json['invoice_id'] as String? ?? '',
+        uri: json['uri'] as String? ?? '',
+        channelId: json['channel_id'] as String? ?? '',
+        amountSat: (json['amount_sat'] as num?)?.toInt() ?? 0,
+        memo: json['memo'] as String? ?? '',
+        status: json['status'] as String? ?? '',
+        createdAt: json['created_at'] as String? ?? '',
+        expiresAt: json['expires_at'] as String? ?? '',
+        paidAt: json['paid_at'] as String?,
+        payerChannelId: json['payer_channel_id'] as String?,
+      );
+}
+
+/// Request to create an invoice (payee side).
+class CreateInvoiceReq {
+  final String channelId;
+  final int amountSat;
+  final String memo;
+  final int expirySeconds; // 0 = LSP default (1h)
+
+  const CreateInvoiceReq({
+    required this.channelId,
+    required this.amountSat,
+    this.memo = '',
+    this.expirySeconds = 0,
+  });
+
+  Map<String, dynamic> toJson() => {
+        'channel_id': channelId,
+        'amount_sat': amountSat,
+        'memo': memo,
+        'expiry_seconds': expirySeconds,
+      };
+}
+
+/// Response to paying an invoice (payer side). Mirrors updateState's response
+/// shape plus the settled invoice.
+class PayInvoiceResp {
+  final bool accepted;
+  final String? rejectReason;
+  final String? peerSignatureHex;
+  final String? settlementSignatureHex;
+  final LnInvoice? invoice; // the paid invoice (on success)
+
+  const PayInvoiceResp({
+    required this.accepted,
+    this.rejectReason,
+    this.peerSignatureHex,
+    this.settlementSignatureHex,
+    this.invoice,
+  });
+
+  factory PayInvoiceResp.fromJson(Map<String, dynamic> json) => PayInvoiceResp(
+        accepted: json['accepted'] as bool? ?? false,
+        rejectReason: json['reject_reason'] as String?,
+        peerSignatureHex: json['peer_signature_hex'] as String?,
+        settlementSignatureHex: json['settlement_signature_hex'] as String?,
+        invoice: json['invoice'] is Map<String, dynamic>
+            ? LnInvoice.fromJson(json['invoice'] as Map<String, dynamic>)
+            : null,
+      );
+}
+
+/// Request to pay an invoice: the payer's channel plus its eLTOO state update
+/// (updateState's fields — the channel id moves into the body because the URL
+/// identifies the INVOICE here).
+class PayInvoiceReq {
+  final String channelId; // payer channel
+  final int stateIndex;
+  final int initiatorBalanceSat;
+  final int peerBalanceSat;
+  final String updateTxHex;
+  final String settlementTxHex;
+  final String ctvHash;
+
+  const PayInvoiceReq({
+    required this.channelId,
+    required this.stateIndex,
+    required this.initiatorBalanceSat,
+    required this.peerBalanceSat,
+    required this.updateTxHex,
+    required this.settlementTxHex,
+    required this.ctvHash,
+  });
+
+  Map<String, dynamic> toJson() => {
+        'channel_id': channelId,
+        'state_index': stateIndex,
+        'initiator_balance_sat': initiatorBalanceSat,
+        'peer_balance_sat': peerBalanceSat,
+        'update_tx_hex': updateTxHex,
+        'settlement_tx_hex': settlementTxHex,
+        'ctv_hash': ctvHash,
+      };
 }
