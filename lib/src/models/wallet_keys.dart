@@ -84,7 +84,7 @@ enum SoqNetwork {
       case SoqNetwork.stagenet:
         return 'https://soqushield-api.research-c26.workers.dev';
       case SoqNetwork.mainnet:
-        return 'https://mainnet-sim-proxy.research-c26.workers.dev/api';  // Phase B3: sim proxy → stagenet (SIMULATION-ONLY)
+        return 'https://mainnet-api.soqu.org';
     }
   }
 
@@ -94,7 +94,7 @@ enum SoqNetwork {
       case SoqNetwork.stagenet:
         return 'http://143.110.229.69:3001';
       case SoqNetwork.mainnet:
-        return 'http://143.110.229.69:3001';  // Phase B3: same VPS (sim mode)
+        return 'https://mainnet-api.soqu.org';
     }
   }
 
