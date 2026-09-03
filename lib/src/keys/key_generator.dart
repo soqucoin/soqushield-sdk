@@ -46,14 +46,10 @@ class KeyGenerator {
     int accountIndex = 0,
     String passphrase = '',
   }) async {
-    final masterSeed = bip39.mnemonicToSeed(phrase.mnemonic, passphrase: passphrase);
-    final dilithiumSeed = _hkdfDerive(
-      Uint8List.fromList(masterSeed),
-      _buildDeriveInfo(accountIndex),
-    );
-
-    final native = DilithiumNative.instance;
-    final (pubKeyBytes, _) = native.keypairFromSeed(dilithiumSeed);
+    final masterSeedBytes = Uint8List.fromList(bip39.mnemonicToSeed(phrase.mnemonic, passphrase: passphrase));
+    final (pubKeyBytes, secretKey) = deriveKeyPairWithRetry(masterSeedBytes, accountIndex);
+    secretKey.fillRange(0, secretKey.length, 0);
+    masterSeedBytes.fillRange(0, masterSeedBytes.length, 0);
 
     final address = deriveAddress(pubKeyBytes, network);
     final path = "m/44'/$coinType'/0'/0/$accountIndex";
@@ -77,14 +73,12 @@ class KeyGenerator {
     int accountIndex = 0,
     String passphrase = '',
   }) async {
-    final masterSeed = bip39.mnemonicToSeed(phrase.mnemonic, passphrase: passphrase);
-    final dilithiumSeed = _hkdfDerive(
-      Uint8List.fromList(masterSeed),
-      _buildDeriveInfo(accountIndex),
-    );
-
-    final native = DilithiumNative.instance;
-    return native.keypairFromSeed(dilithiumSeed);
+    final masterSeedBytes = Uint8List.fromList(bip39.mnemonicToSeed(phrase.mnemonic, passphrase: passphrase));
+    try {
+      return deriveKeyPairWithRetry(masterSeedBytes, accountIndex);
+    } finally {
+      masterSeedBytes.fillRange(0, masterSeedBytes.length, 0);
+    }
   }
 
   /// Derive a Bech32m address from a Dilithium public key.
@@ -102,13 +96,40 @@ class KeyGenerator {
 
   // ─── Private Helpers ───
 
-  Uint8List _buildDeriveInfo(int accountIndex) {
+  /// Invalid-marker retry rule, shared with the node (pqderive.h,
+  /// MAX_DERIVE_RETRIES) and the SoquShield app. The node's CPubKey treats a
+  /// public key whose first byte is 0xFF as its invalid-key sentinel: one path
+  /// in 256 derives a key whose address receives and can never spend. Retry 0
+  /// is the unchanged derivation (info = domain || path bytes); retry r >= 1
+  /// appends a single byte r to the HKDF info; the first key not starting with
+  /// 0xFF is THE key for that path. Existing valid keys are unaffected.
+  static const int maxDeriveRetries = 8;
+
+  Uint8List _buildDeriveInfo(int accountIndex, {int retry = 0}) {
     final domainBytes = Uint8List.fromList(_domainWallet.codeUnits);
     final pathBytesArr = _pathToBytes(44, coinType, 0, 0, accountIndex);
-    final info = Uint8List(domainBytes.length + pathBytesArr.length);
+    final info = Uint8List(domainBytes.length + pathBytesArr.length + (retry > 0 ? 1 : 0));
     info.setRange(0, domainBytes.length, domainBytes);
-    info.setRange(domainBytes.length, info.length, pathBytesArr);
+    info.setRange(domainBytes.length, domainBytes.length + pathBytesArr.length, pathBytesArr);
+    if (retry > 0) info[info.length - 1] = retry;
     return info;
+  }
+
+  /// Derive the ML-DSA-44 key pair for [accountIndex], applying the
+  /// invalid-marker retry rule. The caller owns zeroing the secret key.
+  (Uint8List, Uint8List) deriveKeyPairWithRetry(Uint8List masterSeed, int accountIndex) {
+    final native = DilithiumNative.instance;
+    for (var retry = 0; retry <= maxDeriveRetries; retry++) {
+      final dilithiumSeed = _hkdfDerive(masterSeed, _buildDeriveInfo(accountIndex, retry: retry));
+      try {
+        final (pk, sk) = native.keypairFromSeed(dilithiumSeed);
+        if (pk[0] != 0xFF) return (pk, sk);
+        sk.fillRange(0, sk.length, 0); // the marker key is discarded
+      } finally {
+        dilithiumSeed.fillRange(0, dilithiumSeed.length, 0);
+      }
+    }
+    throw StateError('key derivation produced only invalid-marker keys for index $accountIndex');
   }
 
   Uint8List _pathToBytes(int purpose, int coinType, int account, int change, int index) {
