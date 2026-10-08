@@ -14,7 +14,6 @@ The SoquShield SDK exposes the same ML-DSA-44 (FIPS 204 Dilithium) cryptographic
 - **Key Derivation** — BIP-39 mnemonic → HKDF-SHA256 → Dilithium seed (Halborn-audited derivation chain)
 - **Address Codec** — Bech32m encoding/decoding for Soqucoin mainnet and testnet addresses
 - **RPC Client** — Typed JSON-RPC client for the Soqucoin node
-- **Vault Bridge** — pSOQ↔SOQ cross-chain bridge operations (coming soon)
 - **Pure Dart** — No Flutter dependency. Works on iOS, Android, macOS, Linux, Windows, and web.
 
 ## Quick Start
